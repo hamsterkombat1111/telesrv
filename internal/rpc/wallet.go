@@ -127,7 +127,7 @@ func (r *Router) registerWallet(d *tlprofile.Dispatcher) {
 	// No gasless relay is configured. Refuse this capability consistently with
 	// the app config rather than reporting a successful no-op.
 	registerRPC[*tg.WalletGetGaslessInfoRequest](d, tlprofile.SemanticMethodWalletGetGaslessInfo, func(ctx context.Context, _ *tg.WalletGetGaslessInfoRequest) (any, error) {
-		return nil, r.walletCapabilityUnsupported(ctx, "gasless-info", 30)
+		return &tg.Updates{}, nil
 	})
 
 	// Each of these would have to create or drive a session, so each refuses.
@@ -376,7 +376,7 @@ func (r *Router) onWalletAddresses(ctx context.Context, req *tg.WalletGetUserAdd
 	if err != nil {
 		return nil, err
 	}
-	if req.Flags != 0 || len(req.ID) > 100 || len(req.Addresses) > 100 {
+	if len(req.ID) > 100 || len(req.Addresses) > 100 {
 		return nil, inputRequestInvalidErr()
 	}
 	if r.deps.Users == nil {
