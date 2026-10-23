@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"go.uber.org/zap"
 	"bytes"
 	"context"
 	"encoding/hex"
@@ -60,7 +61,7 @@ func (r *Router) registerWallet(d *tlprofile.Dispatcher) {
 		}
 		result, err := r.deps.Wallet.Perform(ctx, req.Endpoint, query, payload)
 		if err != nil {
-			r.logger.Warn("toncenter.performApiRequest failed",
+			r.log.Warn("toncenter.performApiRequest failed",
 				zap.String("endpoint", req.Endpoint),
 				zap.Stringp("query", query),
 				zap.Stringp("payload", payload),
