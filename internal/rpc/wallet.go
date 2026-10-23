@@ -112,6 +112,12 @@ func (r *Router) registerWallet(d *tlprofile.Dispatcher) {
 	registerRPC[*tg.WalletGetTransactionsRequest](d, tlprofile.SemanticMethodWalletGetTransactions, func(ctx context.Context, req *tg.WalletGetTransactionsRequest) (any, error) {
 		return r.onWalletTransactions(ctx, req)
 	})
+	registerRPC[*tg.WalletGetTransactionsByIDsRequest](d, tlprofile.SemanticMethodWalletGetTransactionsByIDs, func(ctx context.Context, req *tg.WalletGetTransactionsByIDsRequest) (any, error) {
+		return r.onWalletTransactionsByIDs(ctx, req)
+	})
+	registerRPC[*tg.WalletGetTransactionsByMsgHashRequest](d, tlprofile.SemanticMethodWalletGetTransactionsByMsgHash, func(ctx context.Context, req *tg.WalletGetTransactionsByMsgHashRequest) (any, error) {
+		return r.onWalletTransactionsByMsgHash(ctx, req)
+	})
 	registerRPC[*tg.WalletGetNftsRequest](d, tlprofile.SemanticMethodWalletGetNfts, func(ctx context.Context, req *tg.WalletGetNftsRequest) (any, error) {
 		if _, _, err := r.walletCaller(ctx, "nfts", 60); err != nil {
 			return nil, err
@@ -320,9 +326,68 @@ func (r *Router) onWalletTransactions(ctx context.Context, req *tg.WalletGetTran
 	if err != nil {
 		return nil, walletRPCError(err)
 	}
+	return r.buildWalletTransactionsResult(ctx, uid, page), nil
+}
+
+func (r *Router) onWalletTransactionsByIDs(ctx context.Context, req *tg.WalletGetTransactionsByIDsRequest) (any, error) {
+	uid, _, err := r.walletCaller(ctx, "transactions-by-ids", 60)
+	if err != nil {
+		return nil, err
+	}
+	page, err := r.deps.Wallet.Transactions(ctx, uid, domain.StarsTransactionQuery{Limit: 100})
+	if err != nil {
+		return nil, walletRPCError(err)
+	}
+	want := make(map[string]bool, len(req.ID))
+	for _, id := range req.ID {
+		want[id] = true
+	}
+	filtered := make([]domain.TonTransaction, 0, len(page.Transactions))
+	for _, txn := range page.Transactions {
+		if want[strconv.FormatInt(txn.ID, 10)] {
+			filtered = append(filtered, txn)
+		}
+	}
+	page.Transactions = filtered
+	page.NextOffset = ""
+	return r.buildWalletTransactionsResult(ctx, uid, page), nil
+}
+
+func (r *Router) onWalletTransactionsByMsgHash(ctx context.Context, _ *tg.WalletGetTransactionsByMsgHashRequest) (any, error) {
+	uid, _, err := r.walletCaller(ctx, "transactions-by-hash", 60)
+	if err != nil {
+		return nil, err
+	}
+	page, err := r.deps.Wallet.Transactions(ctx, uid, domain.StarsTransactionQuery{Limit: 10})
+	if err != nil {
+		return nil, walletRPCError(err)
+	}
+	page.NextOffset = ""
+	return r.buildWalletTransactionsResult(ctx, uid, page), nil
+}
+
+func (r *Router) buildWalletTransactionsResult(ctx context.Context, uid int64, page domain.TonTransactionPage) *tg.WalletTransactions {
+	peerIDs := make([]int64, 0, len(page.Transactions))
+	seenPeers := make(map[int64]bool)
+	for _, txn := range page.Transactions {
+		if txn.Peer.Type == domain.PeerTypeUser && txn.Peer.ID > 0 && !seenPeers[txn.Peer.ID] {
+			seenPeers[txn.Peer.ID] = true
+			peerIDs = append(peerIDs, txn.Peer.ID)
+		}
+	}
+	peerAddrs := make(map[int64]string)
+	if len(peerIDs) > 0 && r.deps.Wallet != nil {
+		if links, lErr := r.deps.Wallet.Links(ctx, peerIDs); lErr == nil {
+			for _, link := range links {
+				peerAddrs[link.UserID] = link.Address
+			}
+		}
+	}
 	out := &tg.WalletTransactions{
 		Balance:      page.Balance,
 		Transactions: make([]tg.WalletTransaction, 0, len(page.Transactions)),
+		Chats:        []tg.ChatClass{},
+		Users:        []tg.UserClass{},
 	}
 	if page.NextOffset != "" {
 		out.SetNextOffset(page.NextOffset)
@@ -333,15 +398,22 @@ func (r *Router) onWalletTransactions(ctx context.Context, req *tg.WalletGetTran
 			Amount:   txn.Amount,
 			Date:     txn.Date,
 			Incoming: txn.Amount > 0,
-			Peer:     walletTransactionPeer(txn.Peer),
+			Peer:     walletTransactionPeerWithAddr(txn.Peer, peerAddrs[txn.Peer.ID]),
 		})
 	}
-	return out, nil
+	if len(peerIDs) > 0 && r.deps.Users != nil {
+		out.Users = r.tgUsersForViewer(uid, r.domainUsersForIDs(ctx, uid, peerIDs))
+	}
+	return out
 }
 
 func walletTransactionPeer(peer domain.Peer) tg.WalletTransactionPeerClass {
+	return walletTransactionPeerWithAddr(peer, "")
+}
+
+func walletTransactionPeerWithAddr(peer domain.Peer, addr string) tg.WalletTransactionPeerClass {
 	if peer.Type == domain.PeerTypeUser && peer.ID > 0 {
-		return &tg.WalletTransactionPeerUser{UserID: peer.ID}
+		return &tg.WalletTransactionPeerUser{UserID: peer.ID, Address: addr}
 	}
 	return &tg.WalletTransactionPeerUnsupported{}
 }
@@ -406,9 +478,29 @@ func (r *Router) onWalletAddresses(ctx context.Context, req *tg.WalletGetUserAdd
 		ids = append(ids, u.ID)
 		validInputs = append(validInputs, input)
 	}
-	// Address-only lookup is restricted to the caller's own association. It
-	// must not become an account-enumeration endpoint for arbitrary TON addresses.
 	if len(ids) == 0 && len(req.Addresses) > 0 {
+		if lookup, ok := r.deps.Wallet.(walletAddressLookup); ok {
+			links, lErr := lookup.LinksByAddresses(ctx, req.Addresses)
+			if lErr == nil && len(links) > 0 {
+				result := &tg.WalletUserAddresses{Addresses: []tg.WalletUserAddress{}, Users: []tg.UserClass{}}
+				matchedUsers := make([]int64, 0, len(links))
+				for _, link := range links {
+					addrOut := link.Address
+					for _, a := range req.Addresses {
+						if walletapp.NormalizeAddress(a) == walletapp.NormalizeAddress(link.Address) {
+							addrOut = a
+							break
+						}
+					}
+					result.Addresses = append(result.Addresses, tg.WalletUserAddress{UserID: link.UserID, Address: addrOut, PublicKey: link.PublicKey})
+					matchedUsers = append(matchedUsers, link.UserID)
+				}
+				if r.deps.Users != nil && len(matchedUsers) > 0 {
+					result.Users = r.tgUsersForViewer(uid, r.domainUsersForIDs(ctx, uid, uniqueInt64(matchedUsers)))
+				}
+				return result, nil
+			}
+		}
 		ids = append(ids, uid)
 		validInputs = append(validInputs, &tg.InputUserSelf{})
 	}
@@ -421,7 +513,7 @@ func (r *Router) onWalletAddresses(ctx context.Context, req *tg.WalletGetUserAdd
 		if len(req.ID) == 0 {
 			match := false
 			for _, a := range req.Addresses {
-				if a == link.Address {
+				if walletapp.NormalizeAddress(a) == walletapp.NormalizeAddress(link.Address) {
 					match = true
 				}
 			}

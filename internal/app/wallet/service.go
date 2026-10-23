@@ -391,9 +391,33 @@ func (s *Service) Transfer(ctx context.Context, senderUserID, recipientUserID, a
 		return domain.TonTransactionPage{}, 0, ErrProviderUnavailable
 	}
 	now := int(s.now().Unix())
-	_, recipientBalance, _, _, err := s.transfers.TransferTon(ctx, senderUserID, recipientUserID, amountNanoton, feeNanoton, now)
+	senderBalance, recipientBalance, senderTxID, recipientTxID, err := s.transfers.TransferTon(ctx, senderUserID, recipientUserID, amountNanoton, feeNanoton, now)
 	if err != nil {
 		return domain.TonTransactionPage{}, 0, err
 	}
-	return domain.TonTransactionPage{}, recipientBalance, nil
+	return domain.TonTransactionPage{
+		Balance: senderBalance,
+		Transactions: []domain.TonTransaction{
+			{ID: senderTxID, Amount: -amountNanoton, Date: now, Peer: domain.Peer{Type: domain.PeerTypeUser, ID: recipientUserID}},
+			{ID: recipientTxID, Amount: amountNanoton, Date: now, Peer: domain.Peer{Type: domain.PeerTypeUser, ID: senderUserID}},
+		},
+	}, recipientBalance, nil
 }
+
+type addressLookupStore interface {
+	WalletLinksByAddresses(context.Context, []string) ([]domain.WalletLink, error)
+}
+
+func (s *Service) LinksByAddresses(ctx context.Context, addrs []string) ([]domain.WalletLink, error) {
+	if s == nil || s.store == nil {
+		return nil, ErrProviderUnavailable
+	}
+	if len(addrs) > 100 {
+		return nil, ErrProviderRequest
+	}
+	if ls, ok := s.store.(addressLookupStore); ok {
+		return ls.WalletLinksByAddresses(ctx, addrs)
+	}
+	return nil, nil
+}
+

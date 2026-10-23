@@ -2,6 +2,8 @@ package rpc
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strconv"
 
@@ -14,15 +16,17 @@ import (
 	"telesrv/internal/domain"
 )
 
+type walletAddressLookup interface {
+	LinksByAddresses(ctx context.Context, addrs []string) ([]domain.WalletLink, error)
+}
+
 // registerWalletTransfer wires wallet.sendTransfer#d9e5d9e2.
 //
 // The official client builds and signs an external TON message and hands telesrv
-// the serialized BOC. telesrv runs no TON provider by default, so it cannot
-// broadcast that message -- and pretending it did would show a balance that does
-// not exist on any chain. Instead the payload is parsed for its amount and
-// destination, the move is settled inside telesrv's own nanoton ledger, and both
-// sides get a messageActionGramTransfer#9329ea33 service message, which is
-// exactly the card the client renders for a real transfer.
+// the serialized BOC. telesrv settles the move inside its own nanoton ledger,
+// posts a messageActionGramTransfer#9329ea33 service message to the dialog, and
+// returns Updates containing UpdateMessageID, UpdateNewMessage,
+// UpdateSentWalletTransaction, and UpdateWalletState.
 func (r *Router) registerWalletTransfer(d *tlprofile.Dispatcher) {
 	registerRPC[*tg.WalletSendTransferRequest](d, tlprofile.SemanticMethodWalletSendTransfer, func(ctx context.Context, req *tg.WalletSendTransferRequest) (any, error) {
 		return r.onWalletSendTransfer(ctx, req)
@@ -37,28 +41,38 @@ func (r *Router) onWalletSendTransfer(ctx context.Context, req *tg.WalletSendTra
 	if r.deps.Wallet == nil {
 		return nil, walletRPCError(walletapp.ErrProviderUnavailable)
 	}
-	recipientID, err := r.resolveWalletTransferRecipient(ctx, req.UserID)
+
+	payload := req.DataNormal
+	gasless := false
+	if len(payload) == 0 {
+		payload = req.DataGasless
+		gasless = true
+	}
+	parsed, err := walletapp.ParseTransferPayload(payload)
 	if err != nil {
+		if r.log != nil {
+			r.log.Warn("wallet.sendTransfer invalid payload", zap.Int("len", len(payload)), zap.Error(err))
+		}
+		return nil, tgerr.New(400, "DATA_INVALID")
+	}
+
+	recipientID, err := r.resolveWalletTransferRecipient(ctx, senderID, req.UserID, parsed.Destination)
+	if err != nil {
+		if r.log != nil {
+			r.log.Warn("wallet.sendTransfer invalid recipient",
+				zap.Int64("sender_id", senderID),
+				zap.String("dest", parsed.Destination),
+				zap.Error(err),
+			)
+		}
 		return nil, err
 	}
 	if recipientID == senderID {
 		return nil, tgerr.New(400, "USER_ID_INVALID")
 	}
 
-	payload := req.DataNormal
-	if len(payload) == 0 {
-		// Gasless transfers carry the same logical message in DataGasless. Without
-		// a provider there is nothing to relay either way, but the amount and
-		// destination are still worth honouring.
-		payload = req.DataGasless
-	}
-	parsed, err := walletapp.ParseTransferPayload(payload)
-	if err != nil {
-		return nil, tgerr.New(400, "DATA_INVALID")
-	}
-
 	const fee = int64(0) // telesrv charges no platform fee today.
-	_, recipientBalance, err := r.deps.Wallet.Transfer(ctx, senderID, recipientID, parsed.Amount, fee)
+	page, recipientBalance, err := r.deps.Wallet.Transfer(ctx, senderID, recipientID, parsed.Amount, fee)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrStarsInsufficient):
@@ -72,73 +86,140 @@ func (r *Router) onWalletSendTransfer(ctx context.Context, req *tg.WalletSendTra
 		}
 	}
 
-	// The confirmation card is a service message in both directions: outbound for
-	// the sender, inbound for the recipient. Failing to post it must not roll the
-	// ledger back -- the money already moved -- so the error is logged and the
-	// transfer still reports success.
-	r.postGramTransferMessages(ctx, senderID, recipientID, parsed, recipientBalance)
-
-	// wallet.sendTransfer answers walletState, the same shape wallet.getState
-	// returns, so the client can refresh the balance from the reply.
-	link, balance, ok, stateErr := r.deps.Wallet.State(ctx, senderID)
-	if stateErr != nil || !ok {
-		return &tg.WalletStateEmpty{}, nil
+	now := int(r.clock.Now().Unix())
+	txID := gramTransferTransactionID(senderID, recipientID, parsed.Amount)
+	if len(page.Transactions) > 0 && page.Transactions[0].ID > 0 {
+		txID = strconv.FormatInt(page.Transactions[0].ID, 10)
 	}
-	return &tg.WalletState{Address: link.Address, PublicKey: link.PublicKey, Balance: balance}, nil
+	sum := sha256.Sum256(payload)
+	msgHash := hex.EncodeToString(sum[:])
+
+	updates := r.postGramTransferMessages(ctx, senderID, recipientID, req.RandomID, txID, parsed, recipientBalance, now)
+
+	peerAddress := parsed.Destination
+	if links, lErr := r.deps.Wallet.Links(ctx, []int64{recipientID}); lErr == nil && len(links) > 0 && links[0].Address != "" {
+		peerAddress = links[0].Address
+	}
+
+	tx := tg.WalletTransaction{
+		Incoming: false,
+		Gasless:  gasless,
+		Failed:   false,
+		ID:       txID,
+		Amount:   parsed.Amount,
+		Fee:      fee,
+		Date:     now,
+		Peer: &tg.WalletTransactionPeerUser{
+			UserID:  recipientID,
+			Address: peerAddress,
+		},
+	}
+	if parsed.Comment != "" {
+		tx.SetComment(parsed.Comment)
+	}
+	tx.SetTxHash(msgHash)
+
+	sentUpdate := &tg.UpdateSentWalletTransaction{
+		Gasless: gasless,
+		MsgHash: msgHash,
+	}
+	sentUpdate.SetTransaction(tx)
+	updates.Updates = append(updates.Updates, sentUpdate)
+
+	if link, balance, ok, stateErr := r.deps.Wallet.State(ctx, senderID); stateErr == nil && ok {
+		updates.Updates = append(updates.Updates, &tg.UpdateWalletState{
+			State: &tg.WalletState{
+				Address:   link.Address,
+				PublicKey: link.PublicKey,
+				Balance:   balance,
+			},
+		})
+	}
+	return updates, nil
 }
 
-// resolveWalletTransferRecipient turns the TL InputUser into a local user id.
-func (r *Router) resolveWalletTransferRecipient(ctx context.Context, input tg.InputUserClass) (int64, error) {
-	if input == nil {
-		return 0, tgerr.New(400, "USER_ID_INVALID")
+// resolveWalletTransferRecipient turns the TL InputUser or destination TON address into a local user id.
+func (r *Router) resolveWalletTransferRecipient(ctx context.Context, senderID int64, input tg.InputUserClass, destinationAddr string) (int64, error) {
+	if input != nil {
+		if _, isEmpty := input.(*tg.InputUserEmpty); !isEmpty {
+			ids, err := r.userIDsFromInputUsers(ctx, senderID, []tg.InputUserClass{input})
+			if err == nil && len(ids) > 0 && ids[0] > 0 {
+				return ids[0], nil
+			}
+			if u, ok := input.(*tg.InputUser); ok && u.UserID > 0 && r.deps.Users != nil {
+				user, found, uErr := r.deps.Users.AdminUser(ctx, u.UserID)
+				if uErr == nil && found && !user.Deleted && user.ID > 0 {
+					return user.ID, nil
+				}
+			}
+		}
 	}
-	ids, err := r.userIDsFromInputUsers(ctx, 0, []tg.InputUserClass{input})
-	if err != nil || len(ids) == 0 || ids[0] <= 0 {
-		return 0, tgerr.New(400, "USER_ID_INVALID")
+	if destinationAddr != "" && r.deps.Wallet != nil {
+		if lookup, ok := r.deps.Wallet.(walletAddressLookup); ok {
+			links, err := lookup.LinksByAddresses(ctx, []string{destinationAddr})
+			if err == nil && len(links) > 0 && links[0].UserID > 0 {
+				return links[0].UserID, nil
+			}
+		}
 	}
-	return ids[0], nil
+	return 0, tgerr.New(400, "USER_ID_INVALID")
 }
 
-// postGramTransferMessages writes the two service messages that render the
-// transfer card. Both carry the same frozen snapshot so a replay is stable.
-func (r *Router) postGramTransferMessages(ctx context.Context, senderID, recipientID int64, parsed walletapp.ParsedTransfer, recipientBalance int64) {
+// postGramTransferMessages writes the private service message for both sender and recipient
+// and builds the sender's Updates response.
+func (r *Router) postGramTransferMessages(ctx context.Context, senderID, recipientID, reqRandomID int64, txID string, parsed walletapp.ParsedTransfer, _ int64, now int) *tg.Updates {
+	emptyUpdates := &tg.Updates{
+		Updates: []tg.UpdateClass{},
+		Users:   []tg.UserClass{},
+		Chats:   []tg.ChatClass{},
+		Date:    now,
+	}
 	if r.deps.Messages == nil {
-		return
+		return emptyUpdates
+	}
+	peerAddress := parsed.Destination
+	if r.deps.Wallet != nil {
+		if links, err := r.deps.Wallet.Links(ctx, []int64{recipientID}); err == nil && len(links) > 0 && links[0].Address != "" {
+			peerAddress = links[0].Address
+		}
 	}
 	action := &domain.MessageServiceAction{
 		Kind: domain.MessageServiceActionGramTransfer,
 		GramTransfer: &domain.MessageGramTransferAction{
 			Amount:        parsed.Amount,
-			PeerAddress:   parsed.Destination,
-			TransactionID: gramTransferTransactionID(senderID, recipientID, parsed.Amount),
+			PeerAddress:   peerAddress,
+			TransactionID: txID,
 			Comment:       parsed.Comment,
 		},
 	}
 	media := &domain.MessageMedia{Kind: domain.MessageMediaKindService, ServiceAction: action}
 
-	// Outbound copy in the sender's dialog.
-	if _, err := r.deps.Messages.PostPrivateServiceMessage(ctx, senderID, senderID, domain.SendPrivateTextRequest{
+	randomID := reqRandomID
+	if randomID == 0 {
+		randomID = gramTransferRandomID(senderID, recipientID, parsed.Amount) ^ int64(now)
+	}
+	sessionID, _ := SessionIDFrom(ctx)
+	res, err := r.deps.Messages.PostPrivateServiceMessage(ctx, recipientID, senderID, domain.SendPrivateTextRequest{
 		RecipientUserID: recipientID,
 		SenderUserID:    senderID,
-		RandomID:        gramTransferRandomID(senderID, recipientID, parsed.Amount),
+		RandomID:        randomID,
 		Media:           media,
-	}); err != nil {
-		r.logGramTransferMessageFailure("sender", senderID, recipientID, err)
+		Date:            now,
+		OriginAuthKeyID: rawAuthKeyIDForOrigin(ctx),
+		OriginSessionID: sessionID,
+	})
+	if err != nil {
+		r.logGramTransferMessageFailure("transfer", senderID, recipientID, err)
+		return emptyUpdates
 	}
-	// Inbound copy in the recipient's dialog.
-	if _, err := r.deps.Messages.PostPrivateServiceMessage(ctx, recipientID, senderID, domain.SendPrivateTextRequest{
-		RecipientUserID: recipientID,
-		SenderUserID:    senderID,
-		RandomID:        gramTransferRandomID(recipientID, senderID, parsed.Amount),
-		Media:           media,
-	}); err != nil {
-		r.logGramTransferMessageFailure("recipient", recipientID, senderID, err)
+	if res.SenderMessage.ID <= 0 {
+		return emptyUpdates
 	}
+	users := r.usersForMessageUpdate(ctx, senderID, res.SenderMessage)
+	chats := r.chatsForMessageUpdate(ctx, senderID, res.SenderMessage)
+	return tgPrivateSendResultUpdates(res, reqRandomID, reqRandomID != 0, users, chats)
 }
 
-// logGramTransferMessageFailure records a failed card post without failing the
-// transfer: the ledger already moved, and a missing card is a rendering problem
-// rather than a lost payment.
 func (r *Router) logGramTransferMessageFailure(side string, ownerID, peerID int64, err error) {
 	if r.log == nil {
 		return

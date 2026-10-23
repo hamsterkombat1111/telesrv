@@ -376,3 +376,61 @@ func (s *FileStore) ValidateKeyCipher(keys *KeyCipher) error {
 		}
 	}
 }
+
+// NormalizeAddress returns the canonical raw TON address if valid, or trimmed string.
+func NormalizeAddress(raw string) string {
+	if c, err := domain.CanonicalTONAddress(raw); err == nil && c != "" {
+		return c
+	}
+	return strings.TrimSpace(raw)
+}
+
+func (s *FileStore) WalletLinksByAddresses(ctx context.Context, addrs []string) ([]domain.WalletLink, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	want := make(map[string]bool, len(addrs))
+	for _, a := range addrs {
+		if norm := NormalizeAddress(a); norm != "" {
+			want[norm] = true
+		}
+	}
+	if len(want) == 0 {
+		return nil, nil
+	}
+	dir, err := os.Open(s.dir)
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
+	var result []domain.WalletLink
+	for {
+		entries, err := dir.ReadDir(128)
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if entry.IsDir() || !strings.HasSuffix(name, ".json") {
+				continue
+			}
+			id, parseErr := strconv.ParseInt(strings.TrimSuffix(name, ".json"), 10, 64)
+			if parseErr != nil || id <= 0 {
+				continue
+			}
+			record, readErr := s.read(id)
+			if readErr != nil || record.Link == nil {
+				continue
+			}
+			if want[NormalizeAddress(record.Link.Address)] {
+				result = append(result, *record.Link)
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+	}
+	return result, nil
+}
