@@ -48,25 +48,44 @@ func ParseTransferPayload(boc []byte) (ParsedTransfer, error) {
 }
 
 func parseTransferCell(root *cell.Cell) (ParsedTransfer, error) {
-	// The signed message is an external-in message whose body is either the
-	// internal transfer directly or a wallet-v5 action list wrapping it. Try the
-	// relaxed message form first because that is what the current wallet
-	// produces, then fall back to a bare internal message.
-	var relaxed tlb.MessageRelaxed
-	if err := tlb.LoadFromCell(&relaxed, root.MustBeginParse()); err == nil {
-		if parsed, ok := transferFromRelaxed(relaxed); ok {
-			return parsed, nil
-		}
+	if parsed, ok := findTransferInTree(root, 0); ok {
+		return parsed, nil
+	}
+	return ParsedTransfer{}, fmt.Errorf("%w: no internal transfer found", ErrTransferPayloadInvalid)
+}
+
+func findTransferInTree(c *cell.Cell, depth int) (ParsedTransfer, bool) {
+	if c == nil || depth > 10 {
+		return ParsedTransfer{}, false
 	}
 	var msg tlb.Message
-	if err := tlb.LoadFromCell(&msg, root.MustBeginParse()); err == nil {
+	if err := tlb.LoadFromCell(&msg, c.MustBeginParse()); err == nil {
 		if internal, ok := msg.Msg.(*tlb.InternalMessage); ok && internal != nil {
 			if parsed, ok := transferFromInternal(internal); ok {
-				return parsed, nil
+				return parsed, true
+			}
+		}
+		if ext, ok := msg.Msg.(*tlb.ExternalMessage); ok && ext != nil && ext.Body != nil {
+			if parsed, ok := findTransferInTree(ext.Body, depth+1); ok {
+				return parsed, true
 			}
 		}
 	}
-	return ParsedTransfer{}, fmt.Errorf("%w: no internal transfer found", ErrTransferPayloadInvalid)
+	var relaxed tlb.MessageRelaxed
+	if err := tlb.LoadFromCell(&relaxed, c.MustBeginParse()); err == nil {
+		if parsed, ok := transferFromRelaxed(relaxed); ok {
+			return parsed, true
+		}
+	}
+	for i := 0; i < int(c.RefsNum()); i++ {
+		ref, err := c.PeekRef(i)
+		if err == nil && ref != nil {
+			if parsed, ok := findTransferInTree(ref, depth+1); ok {
+				return parsed, true
+			}
+		}
+	}
+	return ParsedTransfer{}, false
 }
 
 func transferFromRelaxed(msg tlb.MessageRelaxed) (ParsedTransfer, bool) {
@@ -83,10 +102,11 @@ func transferFromRelaxed(msg tlb.MessageRelaxed) (ParsedTransfer, bool) {
 	if amount == nil || amount.Sign() <= 0 {
 		return ParsedTransfer{}, false
 	}
+	comment := commentFromBody(msg.Body.Ref)
 	return ParsedTransfer{
 		Amount:      amount.Int64(),
 		Destination: dst.String(),
-		Comment:     commentFromBody(msg.Body.Ref),
+		Comment:     comment,
 	}, true
 }
 
@@ -98,10 +118,14 @@ func transferFromInternal(msg *tlb.InternalMessage) (ParsedTransfer, bool) {
 	if amount == nil || amount.Sign() <= 0 {
 		return ParsedTransfer{}, false
 	}
+	comment := msg.Comment()
+	if comment == "" {
+		comment = commentFromBody(msg.Body)
+	}
 	return ParsedTransfer{
 		Amount:      amount.Int64(),
 		Destination: msg.DstAddr.String(),
-		Comment:     commentFromBody(msg.Body),
+		Comment:     comment,
 	}, true
 }
 
@@ -113,6 +137,15 @@ func commentFromBody(body *cell.Cell) string {
 		return ""
 	}
 	slice := body.MustBeginParse()
+	if slice.BitsLeft() < 32 && slice.RefsNum() > 0 {
+		ref, err := slice.LoadRef()
+		if err == nil && ref != nil {
+			slice = ref
+		}
+	}
+	if slice.BitsLeft() < 32 {
+		return ""
+	}
 	op, err := slice.LoadUInt(32)
 	if err != nil || op != 0 {
 		return ""
