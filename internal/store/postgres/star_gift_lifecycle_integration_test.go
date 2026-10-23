@@ -1,0 +1,2207 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"telesrv/deploy"
+	"telesrv/internal/domain"
+)
+
+func TestStarGiftLifecycleAggregatePostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	suffix := randomSuffix(t)
+	now := int(time.Now().Unix())
+	users := NewUserStore(pool)
+	buyer := createTestUser(t, ctx, users, "+1881"+suffix+"01", "GiftBuyer", "")
+	owner := createTestUser(t, ctx, users, "+1881"+suffix+"02", "GiftOwner", "")
+	offerBuyer := createTestUser(t, ctx, users, "+1881"+suffix+"03", "OfferBuyer", "")
+	resaleBuyer := createTestUser(t, ctx, users, "+1881"+suffix+"04", "ResaleBuyer", "")
+	loser := createTestUser(t, ctx, users, "+1881"+suffix+"05", "AuctionLoser", "")
+	prepayPayer := createTestUser(t, ctx, users, "+1881"+suffix+"06", "PrepayPayer", "")
+	ownerPeer := domain.Peer{Type: domain.PeerTypeUser, ID: owner.ID}
+
+	stars := NewStarsStore(pool)
+	for _, user := range []domain.User{buyer, owner, offerBuyer, resaleBuyer, loser, prepayPayer} {
+		if _, _, err := stars.EnsureGrant(ctx, user.ID, 10000, now); err != nil {
+			t.Fatalf("grant stars to %d: %v", user.ID, err)
+		}
+	}
+
+	gifts := NewStarGiftStore(pool)
+	baseDocumentID := time.Now().UnixNano() & 0x7ffffffffffff000
+	entry, err := gifts.CreateCatalogRevision(ctx, domain.StarGiftCatalogWrite{
+		Title: "Lifecycle " + suffix, Stars: 50, ConvertStars: 20, Enabled: true,
+		Document: collectibleTestDocument(baseDocumentID, "lifecycle.tgs"),
+		Blob:     collectibleTestBlob(baseDocumentID, "lifecycle"), Animation: collectibleTestAnimation("lifecycle.tgs"),
+		Actor: "integration", CommandID: "lifecycle-catalog-" + suffix,
+	})
+	if err != nil {
+		t.Fatalf("create lifecycle catalog: %v", err)
+	}
+	if _, err := gifts.PublishCollectibleRevision(ctx, domain.StarGiftCollectibleWrite{
+		GiftID: entry.Gift.ID, UpgradeStars: 100, SupplyTotal: 20, SlugPrefix: "life-" + suffix,
+		Models: []domain.StarGiftCollectibleAttribute{
+			{Kind: domain.StarGiftCollectibleModel, Name: "Base", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestDocumentPtr(baseDocumentID+1, "model.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+1, "model"), Animation: collectibleTestAnimationPtr("model.tgs")},
+			{Kind: domain.StarGiftCollectibleModel, Name: "Crafted", RarityKind: domain.StarGiftRarityLegendary, Crafted: true,
+				Document: collectibleTestDocumentPtr(baseDocumentID+2, "crafted.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+2, "crafted"), Animation: collectibleTestAnimationPtr("crafted.tgs")},
+			{Kind: domain.StarGiftCollectibleModel, Name: "Base Two", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestDocumentPtr(baseDocumentID+4, "model-two.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+4, "model-two"), Animation: collectibleTestAnimationPtr("model-two.tgs")},
+		},
+		Patterns: []domain.StarGiftCollectibleAttribute{
+			{Kind: domain.StarGiftCollectiblePattern, Name: "Orbit", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestPatternDocumentPtr(baseDocumentID+3, "pattern.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+3, "pattern"), Animation: collectibleTestAnimationPtr("pattern.tgs")},
+			{Kind: domain.StarGiftCollectiblePattern, Name: "Orbit Two", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestPatternDocumentPtr(baseDocumentID+5, "pattern-two.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+5, "pattern-two"), Animation: collectibleTestAnimationPtr("pattern-two.tgs")},
+		},
+		Backdrops: []domain.StarGiftCollectibleAttribute{
+			{Kind: domain.StarGiftCollectibleBackdrop, Name: "Night", BackdropID: 77, CenterColor: 0x112233, EdgeColor: 0x223344, PatternColor: 0x334455, TextColor: 0xffffff, RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000},
+			{Kind: domain.StarGiftCollectibleBackdrop, Name: "Day", BackdropID: 78, CenterColor: 0xaabbcc, EdgeColor: 0x778899, PatternColor: 0xddeeff, TextColor: 0x111111, RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000},
+		},
+		Actor: "integration", CommandID: "lifecycle-pool-" + suffix,
+	}); err != nil {
+		t.Fatalf("publish lifecycle pool: %v", err)
+	}
+
+	messages := NewMessageStore(pool)
+	lifecycle := NewStarGiftLifecycleStore(pool, messages, 1_000_000, WithStarGiftMarketPolicy(domain.StarGiftMarketPolicy{
+		StarsProceedsPermille: 900, TONProceedsPermille: 900,
+	}))
+	upgrades := NewStarGiftUpgradeStore(pool, messages, WithStarGiftLifecyclePolicy(domain.StarGiftLifecyclePolicy{
+		TransferStars: 25, DropOriginalDetailsStars: 25, OfferMinStars: 1, CraftChancePermille: 500,
+	}))
+
+	purchaseReq := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: buyer.ID, To: ownerPeer,
+		GiftID: entry.Gift.ID, CommandKey: "purchase-" + suffix, Date: now, Message: "hello"})
+	purchased, err := lifecycle.PurchaseStarGift(ctx, purchaseReq)
+	if err != nil {
+		t.Fatalf("purchase gift: %v", err)
+	}
+	if purchased.Saved.ID <= 0 || purchased.Saved.MsgID <= 0 || purchased.Saved.PrepaidUpgradeHash == "" || purchased.Balance.Balance != 9950 {
+		t.Fatalf("purchase result = %+v", purchased)
+	}
+	ordinaryAction := purchased.Send.RecipientMessage.Media.ServiceAction.StarGift
+	if ordinaryAction == nil || !ordinaryAction.CanUpgrade || ordinaryAction.PrepaidUpgrade ||
+		ordinaryAction.UpgradePriceStars != 100 || ordinaryAction.UpgradeStars != 0 ||
+		ordinaryAction.PrepaidUpgradeHash != "" {
+		t.Fatalf("ordinary purchase action mixed paid price with prepaid amount: %+v", ordinaryAction)
+	}
+	senderOrdinaryAction := purchased.Send.SenderMessage.Media.ServiceAction.StarGift
+	if senderOrdinaryAction == nil || senderOrdinaryAction.CanUpgrade ||
+		senderOrdinaryAction.PrepaidUpgradeHash != purchased.Saved.PrepaidUpgradeHash {
+		t.Fatalf("ordinary sender purchase projection = %+v", senderOrdinaryAction)
+	}
+	replayedPurchase, err := lifecycle.PurchaseStarGift(ctx, purchaseReq)
+	if err != nil || !replayedPurchase.Duplicate || replayedPurchase.Saved.ID != purchased.Saved.ID || replayedPurchase.Balance.Balance != 9950 ||
+		replayedPurchase.Send.SenderMessage.ID != purchased.Send.SenderMessage.ID ||
+		replayedPurchase.Send.RecipientMessage.ID != purchased.Send.RecipientMessage.ID {
+		t.Fatalf("purchase replay = %+v err %v", replayedPurchase, err)
+	}
+	verifyPrepaidViewerProjectionMigrationNoop(t, ctx, pool, purchased.Saved.ID, owner.ID, buyer.ID,
+		purchased.Send.RecipientMessage.ID, purchased.Send.SenderMessage.ID)
+
+	target, price, err := lifecycle.PrepaidUpgradeTarget(ctx, ownerPeer, purchased.Saved.PrepaidUpgradeHash)
+	if err != nil || target.ID != purchased.Saved.ID || price != 100 {
+		t.Fatalf("prepaid target = %+v price %d err %v", target, price, err)
+	}
+	prepaid, err := lifecycle.PrepayStarGiftUpgrade(ctx, domain.StarGiftPrepaidUpgradeRequest{
+		PayerUserID: prepayPayer.ID, Owner: ownerPeer, Hash: purchased.Saved.PrepaidUpgradeHash,
+		ChargeStars: 100, FormID: 11002, CommandKey: "prepay-" + suffix, Date: now + 1,
+	})
+	if err != nil || prepaid.Saved.PrepaidUpgradeStars != 100 || prepaid.Saved.PrepaidUpgradeHash != "" || prepaid.Balance.Balance != 9900 {
+		t.Fatalf("prepay upgrade = %+v err %v", prepaid, err)
+	}
+	prepaySenderAction := prepaid.Send.SenderMessage.Media.ServiceAction.StarGift
+	prepayOwnerAction := prepaid.Send.RecipientMessage.Media.ServiceAction.StarGift
+	if prepaySenderAction == nil || prepayOwnerAction == nil ||
+		prepaySenderAction.GiftMsgID != 0 ||
+		prepayOwnerAction.GiftMsgID != purchased.Send.RecipientMessage.ID {
+		t.Fatalf("prepay gift_msg_id is not owner-only: sender=%+v owner=%+v purchase=%+v",
+			prepaySenderAction, prepayOwnerAction, purchased.Send)
+	}
+	prepaySenderDifference, err := NewUpdateEventStore(pool).ListAfter(ctx, prepayPayer.ID, prepaid.Send.SenderMessage.Pts-1, 1)
+	if err != nil || len(prepaySenderDifference) != 1 || prepaySenderDifference[0].Message.Media == nil ||
+		prepaySenderDifference[0].Message.Media.ServiceAction == nil ||
+		prepaySenderDifference[0].Message.Media.ServiceAction.StarGift == nil ||
+		prepaySenderDifference[0].Message.Media.ServiceAction.StarGift.GiftMsgID != 0 {
+		t.Fatalf("payer prepay difference leaked owner-only gift_msg_id: events=%+v err=%v", prepaySenderDifference, err)
+	}
+	prepayOwnerDifference, err := NewUpdateEventStore(pool).ListAfter(ctx, owner.ID, prepaid.Send.RecipientMessage.Pts-1, 1)
+	if err != nil || len(prepayOwnerDifference) != 1 || prepayOwnerDifference[0].Message.Media == nil ||
+		prepayOwnerDifference[0].Message.Media.ServiceAction == nil ||
+		prepayOwnerDifference[0].Message.Media.ServiceAction.StarGift == nil ||
+		prepayOwnerDifference[0].Message.Media.ServiceAction.StarGift.GiftMsgID != purchased.Send.RecipientMessage.ID {
+		t.Fatalf("owner prepay difference lost box-local gift_msg_id: events=%+v err=%v", prepayOwnerDifference, err)
+	}
+	var sharedPrepayMediaJSON string
+	if err := pool.QueryRow(ctx, `SELECT p.media::text FROM private_messages p
+JOIN message_boxes b ON b.message_sender_id=p.sender_user_id AND b.private_message_id=p.id
+WHERE b.owner_user_id=$1 AND b.box_id=$2`, owner.ID, prepaid.Send.RecipientMessage.ID).Scan(&sharedPrepayMediaJSON); err != nil {
+		t.Fatalf("load shared prepay media: %v", err)
+	}
+	sharedPrepayMedia, err := decodeMessageMedia(sharedPrepayMediaJSON)
+	if err != nil || sharedPrepayMedia == nil || sharedPrepayMedia.ServiceAction == nil ||
+		sharedPrepayMedia.ServiceAction.StarGift == nil || sharedPrepayMedia.ServiceAction.StarGift.GiftMsgID != 0 {
+		t.Fatalf("shared prepay media retained account-local gift_msg_id: media=%+v err=%v", sharedPrepayMedia, err)
+	}
+	if byPrepay, found, err := gifts.GetByRef(ctx, domain.SavedStarGiftRef{Owner: ownerPeer, MsgID: prepaid.Send.RecipientMessage.ID}); err != nil || !found || byPrepay.ID != purchased.Saved.ID {
+		t.Fatalf("prepay owner message ref = %+v found=%v err=%v", byPrepay, found, err)
+	}
+	var ownerPrepayAlias, payerPrepayAlias int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM star_gift_user_message_refs
+WHERE owner_user_id=$1 AND msg_id=$2 AND saved_gift_id=$3`, owner.ID, prepaid.Send.RecipientMessage.ID, purchased.Saved.ID).Scan(&ownerPrepayAlias); err != nil {
+		t.Fatalf("load owner prepay alias: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM star_gift_user_message_refs
+WHERE owner_user_id=$1 AND msg_id=$2`, prepayPayer.ID, prepaid.Send.SenderMessage.ID).Scan(&payerPrepayAlias); err != nil {
+		t.Fatalf("load payer prepay alias: %v", err)
+	}
+	if ownerPrepayAlias != 1 || payerPrepayAlias != 0 {
+		t.Fatalf("prepay aliases owner=%d payer=%d, want owner-only", ownerPrepayAlias, payerPrepayAlias)
+	}
+	upgradeReq := domain.StarGiftUpgradeRequest{
+		UserID: owner.ID, Ref: domain.SavedStarGiftRef{Owner: ownerPeer, MsgID: prepaid.Send.RecipientMessage.ID},
+		RequirePrepaid: true, KeepOriginalDetails: true, CommandKey: "upgrade-" + suffix, Date: now + 2,
+	}
+	upgraded, err := upgrades.UpgradeStarGift(ctx, upgradeReq)
+	if err != nil {
+		t.Fatalf("upgrade prepaid gift: %v", err)
+	}
+	if upgraded.Saved.TransferStars != 25 || upgraded.Saved.DropOriginalDetailsStars != 25 ||
+		upgraded.Saved.CanCraftAt != now+2 ||
+		upgraded.Unique.CraftChancePermille != 500 || !upgraded.Unique.KeepOriginalDetails {
+		t.Fatalf("issued lifecycle snapshot = saved %+v unique %+v", upgraded.Saved, upgraded.Unique)
+	}
+	readinessTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin craft readiness guard probe: %v", err)
+	}
+	if _, err = readinessTx.Exec(ctx, `UPDATE peer_star_gifts SET can_craft_at=0 WHERE id=$1`, upgraded.Saved.ID); err != nil {
+		_ = readinessTx.Rollback(ctx)
+		t.Fatalf("stage mismatched craft readiness: %v", err)
+	}
+	if _, err = readinessTx.Exec(ctx, `SET CONSTRAINTS ALL IMMEDIATE`); err == nil {
+		_ = readinessTx.Rollback(ctx)
+		t.Fatal("deferred guard accepted positive craft chance with zero readiness")
+	}
+	_ = readinessTx.Rollback(ctx)
+	chanceTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin craft chance guard probe: %v", err)
+	}
+	if _, err = chanceTx.Exec(ctx, `UPDATE unique_star_gifts SET craft_chance_permille=0 WHERE id=$1`, upgraded.Unique.ID); err != nil {
+		_ = chanceTx.Rollback(ctx)
+		t.Fatalf("stage mismatched craft chance: %v", err)
+	}
+	if _, err = chanceTx.Exec(ctx, `SET CONSTRAINTS ALL IMMEDIATE`); err == nil {
+		_ = chanceTx.Rollback(ctx)
+		t.Fatal("deferred guard accepted positive readiness with zero craft chance")
+	}
+	_ = chanceTx.Rollback(ctx)
+	terminalTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin atomic craft terminal guard probe: %v", err)
+	}
+	if _, err = terminalTx.Exec(ctx, `UPDATE unique_star_gifts SET craft_chance_permille=0 WHERE id=$1`, upgraded.Unique.ID); err != nil {
+		_ = terminalTx.Rollback(ctx)
+		t.Fatalf("stage terminal craft chance: %v", err)
+	}
+	if _, err = terminalTx.Exec(ctx, `UPDATE peer_star_gifts SET can_craft_at=0 WHERE id=$1`, upgraded.Saved.ID); err != nil {
+		_ = terminalTx.Rollback(ctx)
+		t.Fatalf("stage terminal craft readiness: %v", err)
+	}
+	if _, err = terminalTx.Exec(ctx, `SET CONSTRAINTS ALL IMMEDIATE`); err != nil {
+		_ = terminalTx.Rollback(ctx)
+		t.Fatalf("deferred guard rejected atomic craft terminal state: %v", err)
+	}
+	if err = terminalTx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback atomic craft terminal guard probe: %v", err)
+	}
+	upgradeAction := upgraded.Send.RecipientMessage.Media.ServiceAction.StarGiftUnique
+	senderUpgradeAction := upgraded.Send.SenderMessage.Media.ServiceAction.StarGiftUnique
+	ownerSourceEdit := upgradedSourceEditForMessage(upgraded, owner.ID, purchased.Saved.MsgID)
+	ownerPrepayEdit := upgradedSourceEditForMessage(upgraded, owner.ID, prepaid.Send.RecipientMessage.ID)
+	payerPrepayEdit := upgradedSourceEditForMessage(upgraded, prepayPayer.ID, prepaid.Send.SenderMessage.ID)
+	if upgradeAction == nil || upgradeAction.SavedID != 0 || upgradeAction.Peer.Type != "" || upgradeAction.Peer.ID != 0 ||
+		upgradeAction.CanCraftAt != now+2 || senderUpgradeAction == nil || senderUpgradeAction.SavedID != 0 ||
+		senderUpgradeAction.CanCraftAt != now+2 ||
+		ownerSourceEdit.Message.Media == nil || ownerSourceEdit.Message.Media.ServiceAction == nil ||
+		ownerSourceEdit.Message.Media.ServiceAction.StarGift == nil ||
+		ownerSourceEdit.Message.Media.ServiceAction.StarGift.UpgradeMsgID != upgraded.Saved.UpgradeMsgID ||
+		ownerSourceEdit.Message.Media.ServiceAction.StarGift.CanUpgrade {
+		t.Fatalf("upgrade message linkage = action %+v source edit %+v", upgradeAction, ownerSourceEdit)
+	}
+	if ownerPrepayEdit.Event.Pts <= ownerSourceEdit.Event.Pts || ownerPrepayEdit.Message.Media == nil ||
+		ownerPrepayEdit.Message.Media.ServiceAction == nil || ownerPrepayEdit.Message.Media.ServiceAction.StarGift == nil ||
+		ownerPrepayEdit.Message.Media.ServiceAction.StarGift.CanUpgrade ||
+		ownerPrepayEdit.Message.Media.ServiceAction.StarGift.UpgradeMsgID != upgraded.Send.RecipientMessage.ID {
+		t.Fatalf("owner prepay card did not converge with upgrade: %+v", ownerPrepayEdit)
+	}
+	if payerPrepayEdit.Event.Pts <= prepaid.Send.SenderMessage.Pts || payerPrepayEdit.Message.Media == nil ||
+		payerPrepayEdit.Message.Media.ServiceAction == nil || payerPrepayEdit.Message.Media.ServiceAction.StarGift == nil ||
+		payerPrepayEdit.Message.Media.ServiceAction.StarGift.CanUpgrade ||
+		payerPrepayEdit.Message.Media.ServiceAction.StarGift.UpgradeMsgID != 0 {
+		t.Fatalf("third-party payer prepay card retained an owner action/link: %+v", payerPrepayEdit)
+	}
+	ownerUpgradeDifference, err := NewUpdateEventStore(pool).ListAfter(ctx, owner.ID, upgraded.Send.RecipientMessage.Pts-1, 3)
+	if err != nil || len(ownerUpgradeDifference) != 3 ||
+		ownerUpgradeDifference[0].Type != domain.UpdateEventNewMessage ||
+		ownerUpgradeDifference[1].Type != domain.UpdateEventEditMessage || ownerUpgradeDifference[1].Message.ID != purchased.Saved.MsgID ||
+		ownerUpgradeDifference[2].Type != domain.UpdateEventEditMessage || ownerUpgradeDifference[2].Message.ID != prepaid.Send.RecipientMessage.ID {
+		t.Fatalf("owner prepaid upgrade difference = %+v err=%v", ownerUpgradeDifference, err)
+	}
+	payerUpgradeDifference, err := NewUpdateEventStore(pool).ListAfter(ctx, prepayPayer.ID, prepaid.Send.SenderMessage.Pts, 1)
+	if err != nil || len(payerUpgradeDifference) != 1 || payerUpgradeDifference[0].Type != domain.UpdateEventEditMessage ||
+		payerUpgradeDifference[0].Message.ID != prepaid.Send.SenderMessage.ID {
+		t.Fatalf("payer prepaid upgrade difference = %+v err=%v", payerUpgradeDifference, err)
+	}
+	replayedUpgrade, err := upgrades.UpgradeStarGift(ctx, upgradeReq)
+	if err != nil || !replayedUpgrade.Duplicate || replayedUpgrade.Unique.ID != upgraded.Unique.ID ||
+		upgradedSourceEditForMessage(replayedUpgrade, owner.ID, purchased.Saved.MsgID).Event.Pts != ownerSourceEdit.Event.Pts ||
+		upgradedSourceEditForMessage(replayedUpgrade, owner.ID, prepaid.Send.RecipientMessage.ID).Event.Pts != ownerPrepayEdit.Event.Pts {
+		t.Fatalf("replay prepaid upgrade from notification = %+v err=%v", replayedUpgrade, err)
+	}
+	var sharedUpgradeSourceMediaJSON string
+	if err := pool.QueryRow(ctx, `SELECT p.media::text FROM private_messages p
+JOIN message_boxes b ON b.message_sender_id=p.sender_user_id AND b.private_message_id=p.id
+WHERE b.owner_user_id=$1 AND b.box_id=$2`, owner.ID, purchased.Saved.MsgID).Scan(&sharedUpgradeSourceMediaJSON); err != nil {
+		t.Fatalf("load shared upgraded source media: %v", err)
+	}
+	sharedUpgradeSourceMedia, err := decodeMessageMedia(sharedUpgradeSourceMediaJSON)
+	if err != nil || sharedUpgradeSourceMedia == nil || sharedUpgradeSourceMedia.ServiceAction == nil ||
+		sharedUpgradeSourceMedia.ServiceAction.StarGift == nil ||
+		sharedUpgradeSourceMedia.ServiceAction.StarGift.UpgradeMsgID != 0 ||
+		sharedUpgradeSourceMedia.ServiceAction.StarGift.GiftMsgID != 0 {
+		t.Fatalf("shared upgraded source media retained account-local message id: media=%+v err=%v", sharedUpgradeSourceMedia, err)
+	}
+	var sharedUpgradedPrepayMediaJSON string
+	if err := pool.QueryRow(ctx, `SELECT p.media::text FROM private_messages p
+JOIN message_boxes b ON b.message_sender_id=p.sender_user_id AND b.private_message_id=p.id
+WHERE b.owner_user_id=$1 AND b.box_id=$2`, owner.ID, prepaid.Send.RecipientMessage.ID).Scan(&sharedUpgradedPrepayMediaJSON); err != nil {
+		t.Fatalf("load shared upgraded prepay media: %v", err)
+	}
+	sharedUpgradedPrepayMedia, err := decodeMessageMedia(sharedUpgradedPrepayMediaJSON)
+	if err != nil || sharedUpgradedPrepayMedia == nil || sharedUpgradedPrepayMedia.ServiceAction == nil ||
+		sharedUpgradedPrepayMedia.ServiceAction.StarGift == nil ||
+		sharedUpgradedPrepayMedia.ServiceAction.StarGift.CanUpgrade ||
+		sharedUpgradedPrepayMedia.ServiceAction.StarGift.PrepaidUpgradeHash != "" ||
+		sharedUpgradedPrepayMedia.ServiceAction.StarGift.UpgradeMsgID != 0 ||
+		sharedUpgradedPrepayMedia.ServiceAction.StarGift.GiftMsgID != 0 {
+		t.Fatalf("shared upgraded prepay media retained an action or account-local id: media=%+v err=%v", sharedUpgradedPrepayMedia, err)
+	}
+	verifyPrepaidMessageRefMigration(t, ctx, pool, purchased.Saved.ID, owner.ID, prepayPayer.ID,
+		prepaid.Send.RecipientMessage.ID, prepaid.Send.SenderMessage.ID, upgraded.Send.RecipientMessage.ID)
+	var sharedUpgradeMediaJSON string
+	if err := pool.QueryRow(ctx, `SELECT p.media::text FROM private_messages p
+JOIN message_boxes b ON b.message_sender_id=p.sender_user_id AND b.private_message_id=p.id
+WHERE b.owner_user_id=$1 AND b.box_id=$2`, owner.ID, upgraded.Send.RecipientMessage.ID).Scan(&sharedUpgradeMediaJSON); err != nil {
+		t.Fatalf("load shared upgrade media: %v", err)
+	}
+	sharedUpgradeMedia, err := decodeMessageMedia(sharedUpgradeMediaJSON)
+	if err != nil || sharedUpgradeMedia == nil || sharedUpgradeMedia.ServiceAction == nil ||
+		sharedUpgradeMedia.ServiceAction.StarGiftUnique == nil || sharedUpgradeMedia.ServiceAction.StarGiftUnique.SavedID != 0 {
+		t.Fatalf("shared upgrade media retained account-local saved_id: media=%+v err=%v", sharedUpgradeMedia, err)
+	}
+	dropped, err := lifecycle.DropStarGiftOriginalDetails(ctx, domain.StarGiftDropOriginalDetailsRequest{
+		UserID: owner.ID, Ref: domain.SavedStarGiftRef{Owner: ownerPeer, MsgID: purchased.Saved.MsgID},
+		ChargeStars: 25, FormID: 11003, CommandKey: "drop-" + suffix, Date: now + 3,
+	})
+	if err != nil || dropped.Unique.KeepOriginalDetails || dropped.Saved.DropOriginalDetailsStars != 0 || dropped.Balance.Balance != 9975 {
+		t.Fatalf("drop original details = %+v err %v", dropped, err)
+	}
+
+	// Expiry is driven by the background sweep, refunds exactly once and emits a
+	// durable declined/expired service message even when no user opens the offer.
+	expiring, err := lifecycle.SendStarGiftOffer(ctx, domain.StarGiftOfferRequest{BuyerUserID: offerBuyer.ID,
+		Owner: ownerPeer, Slug: upgraded.Unique.Slug, Price: domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 300},
+		Duration: 120, RandomID: 22001, Date: now + 10,
+	})
+	if err != nil || expiring.Balance.Balance != 9700 {
+		t.Fatalf("send expiring offer = %+v err %v", expiring, err)
+	}
+	if err := lifecycle.SweepStarGiftLifecycle(ctx, now+131, 1000); err != nil {
+		t.Fatalf("sweep expired offer: %v", err)
+	}
+	var expiredStatus string
+	var resolutionNotified bool
+	if err := pool.QueryRow(ctx, `SELECT status,resolution_notified FROM star_gift_offers WHERE id=$1`, expiring.Offer.ID).
+		Scan(&expiredStatus, &resolutionNotified); err != nil || expiredStatus != "expired" || !resolutionNotified {
+		t.Fatalf("expired offer state = %q notified %v err %v", expiredStatus, resolutionNotified, err)
+	}
+	if balance, err := stars.GetBalance(ctx, offerBuyer.ID); err != nil || balance.Balance != 10000 {
+		t.Fatalf("expired offer refund balance = %+v err %v", balance, err)
+	}
+
+	// TON offers use the same durable offer state machine, but only mutate the
+	// internal telesrv TON ledger. Idempotent replay must report that ledger's
+	// balance instead of accidentally projecting the buyer's Stars balance.
+	tonOfferReq := domain.StarGiftOfferRequest{BuyerUserID: offerBuyer.ID,
+		Owner: ownerPeer, Slug: upgraded.Unique.Slug, Price: domain.StarGiftAmount{Currency: domain.StarGiftCurrencyTON, Amount: 300},
+		Duration: 120, RandomID: 22003, Date: now + 132}
+	tonOffer, err := lifecycle.SendStarGiftOffer(ctx, tonOfferReq)
+	if err != nil || tonOffer.Balance.Balance != 999700 {
+		t.Fatalf("send TON offer = %+v err %v", tonOffer, err)
+	}
+	tonOfferReplay, err := lifecycle.SendStarGiftOffer(ctx, tonOfferReq)
+	if err != nil || !tonOfferReplay.Duplicate || tonOfferReplay.Balance.Balance != 999700 {
+		t.Fatalf("replay TON offer = %+v err %v", tonOfferReplay, err)
+	}
+	if _, err := lifecycle.ResolveStarGiftOffer(ctx, domain.StarGiftResolveOfferRequest{
+		OwnerUserID: owner.ID, OfferMsgID: tonOffer.Offer.OfferMsgID, Decline: true, Date: now + 133,
+	}); err != nil {
+		t.Fatalf("decline TON offer: %v", err)
+	}
+	if balance, err := lifecycle.TonBalance(ctx, offerBuyer.ID); err != nil || balance != 1_000_000 {
+		t.Fatalf("declined TON offer refund balance = %d err %v", balance, err)
+	}
+
+	acceptedOffer, err := lifecycle.SendStarGiftOffer(ctx, domain.StarGiftOfferRequest{BuyerUserID: offerBuyer.ID,
+		Owner: ownerPeer, Slug: upgraded.Unique.Slug, Price: domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 300},
+		Duration: 120, RandomID: 22002, Date: now + 140,
+	})
+	if err != nil {
+		t.Fatalf("send accepted offer: %v", err)
+	}
+	accepted, err := lifecycle.ResolveStarGiftOffer(ctx, domain.StarGiftResolveOfferRequest{
+		OwnerUserID: owner.ID, OfferMsgID: acceptedOffer.Offer.OfferMsgID, Date: now + 141,
+	})
+	if err != nil || accepted.Offer.Status != "accepted" || accepted.Unique.Owner.ID != offerBuyer.ID || accepted.Saved.MsgID <= 0 {
+		t.Fatalf("accept offer = %+v err %v", accepted, err)
+	}
+	if balance, err := stars.GetBalance(ctx, owner.ID); err != nil || balance.Balance != 10245 {
+		t.Fatalf("offer seller balance = %+v err %v", balance, err)
+	}
+	var offerCommission int64
+	if err := pool.QueryRow(ctx, `SELECT commission_amount FROM star_gift_sales WHERE command_key=$1`,
+		fmt.Sprintf("offer:%d", acceptedOffer.Offer.ID)).Scan(&offerCommission); err != nil || offerCommission != 30 {
+		t.Fatalf("accepted Stars offer commission = %d err %v", offerCommission, err)
+	}
+
+	listed, err := lifecycle.SetStarGiftListing(ctx, domain.StarGiftListingRequest{ActorUserID: offerBuyer.ID,
+		Ref:    domain.SavedStarGiftRef{Owner: domain.Peer{Type: domain.PeerTypeUser, ID: offerBuyer.ID}, MsgID: accepted.Saved.MsgID},
+		Amount: &domain.StarGiftAmount{Currency: domain.StarGiftCurrencyTON, Amount: 1000}, Date: now + 142,
+	})
+	if err != nil || listed.ResellAmount == nil || listed.ResellAmount.Currency != domain.StarGiftCurrencyTON {
+		t.Fatalf("TON listing = %+v err %v", listed, err)
+	}
+	tonBefore, err := lifecycle.TonBalance(ctx, resaleBuyer.ID)
+	if err != nil || tonBefore != 1_000_000 {
+		t.Fatalf("resale buyer TON grant = %d err %v", tonBefore, err)
+	}
+	resold, err := lifecycle.PurchaseResaleStarGift(ctx, domain.StarGiftResalePurchaseRequest{
+		BuyerUserID: resaleBuyer.ID, Slug: listed.Slug, To: domain.Peer{Type: domain.PeerTypeUser, ID: resaleBuyer.ID},
+		Amount: domain.StarGiftAmount{Currency: domain.StarGiftCurrencyTON, Amount: 1000}, FormID: 11004,
+		CommandKey: "resale-" + suffix, Date: now + 143,
+	})
+	if err != nil || resold.Unique.Owner.ID != resaleBuyer.ID || resold.Balance.Balance != 999000 || resold.Saved.TransferStars != 25 {
+		t.Fatalf("TON resale = %+v err %v", resold, err)
+	}
+	selected, valid := domain.CollectibleEmojiStatus(resold.Unique)
+	if !valid {
+		t.Fatalf("resold collectible cannot project emoji status: %+v", resold.Unique)
+	}
+	if _, err := users.UpdateEmojiStatus(ctx, resaleBuyer.ID, domain.UserEmojiStatus{
+		DocumentID:  selected.DocumentID,
+		Collectible: selected,
+	}); err != nil {
+		t.Fatalf("wear resold collectible: %v", err)
+	}
+	updateEvents := NewUpdateEventStore(pool)
+	statusPtsBeforeTransfer, err := updateEvents.MaxContiguousPts(ctx, resaleBuyer.ID)
+	if err != nil {
+		t.Fatalf("emoji status pts before transfer: %v", err)
+	}
+	if sellerTON, err := lifecycle.TonBalance(ctx, offerBuyer.ID); err != nil || sellerTON != 1_000_900 {
+		t.Fatalf("TON seller local balance = %d err %v", sellerTON, err)
+	}
+	var resaleCommission int64
+	if err := pool.QueryRow(ctx, `SELECT commission_amount FROM star_gift_sales WHERE command_key=$1`, "resale-"+suffix).
+		Scan(&resaleCommission); err != nil || resaleCommission != 100 {
+		t.Fatalf("TON resale commission = %d err %v", resaleCommission, err)
+	}
+	tonPage, err := lifecycle.TonTransactions(ctx, resaleBuyer.ID, domain.StarsTransactionQuery{Limit: 20})
+	if err != nil || tonPage.Balance != 999000 || len(tonPage.Transactions) < 2 {
+		t.Fatalf("TON ledger page = %+v err %v", tonPage, err)
+	}
+
+	transferred, err := lifecycle.TransferStarGift(ctx, domain.StarGiftTransferRequest{ActorUserID: resaleBuyer.ID,
+		Ref: domain.SavedStarGiftRef{Owner: domain.Peer{Type: domain.PeerTypeUser, ID: resaleBuyer.ID}, MsgID: resold.Saved.MsgID},
+		To:  ownerPeer, ChargeStars: 25, FormID: 11005, CommandKey: "transfer-back-" + suffix, Date: now + 144,
+	})
+	if err != nil || transferred.Unique.Owner != ownerPeer || transferred.Saved.TransferStars != 25 || transferred.Balance.Balance != 9975 {
+		t.Fatalf("paid transfer = %+v err %v", transferred, err)
+	}
+	const historicalOwnerMessageID = 2_147_483_000
+	if _, err := pool.Exec(ctx, `INSERT INTO star_gift_user_message_refs(owner_user_id,msg_id,saved_gift_id)
+VALUES($1,$2,$3)`, resaleBuyer.ID, historicalOwnerMessageID, transferred.Saved.ID); err != nil {
+		t.Fatalf("insert historical old-owner message ref: %v", err)
+	}
+	if _, err := gifts.ResolveSavedIDs(ctx, ownerPeer, []domain.SavedStarGiftRef{{
+		Owner: ownerPeer, MsgID: historicalOwnerMessageID,
+	}}); !errors.Is(err, domain.ErrStarGiftNotFound) {
+		t.Fatalf("current owner resolved another owner's historical message ref: %v", err)
+	}
+	var retiredSourceMediaJSON string
+	var retiredSourcePTS int
+	if err := pool.QueryRow(ctx, `SELECT media::text,pts FROM message_boxes
+WHERE owner_user_id=$1 AND box_id=$2 AND NOT deleted`, resaleBuyer.ID, resold.Saved.MsgID).
+		Scan(&retiredSourceMediaJSON, &retiredSourcePTS); err != nil {
+		t.Fatalf("load retired transfer source projection: %v", err)
+	}
+	retiredSourceMedia, err := decodeMessageMedia(retiredSourceMediaJSON)
+	if err != nil || retiredSourceMedia == nil || retiredSourceMedia.ServiceAction == nil ||
+		retiredSourceMedia.ServiceAction.StarGiftUnique == nil {
+		t.Fatalf("decode retired transfer source projection: media=%+v err=%v", retiredSourceMedia, err)
+	}
+	retiredSourceAction := retiredSourceMedia.ServiceAction.StarGiftUnique
+	if retiredSourceAction.Gift.Owner != ownerPeer || retiredSourceAction.Gift.CraftChancePermille != 0 ||
+		!retiredSourceAction.Transferred || retiredSourceAction.Saved || retiredSourceAction.CanCraftAt != 0 ||
+		retiredSourceAction.CanExportAt != 0 || retiredSourceAction.TransferStars != 0 ||
+		retiredSourceAction.CanTransferAt != 0 || retiredSourceAction.CanResellAt != 0 ||
+		retiredSourceAction.DropOriginalDetailsStars != 0 || retiredSourceAction.ResaleAmount != nil {
+		t.Fatalf("retired transfer source remained actionable: %+v", retiredSourceAction)
+	}
+	var retiredEventCount, retiredOutboxCount int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM user_update_events
+WHERE user_id=$1 AND pts=$2 AND event_type='edit_message' AND message_box_id=$3`, resaleBuyer.ID, retiredSourcePTS, resold.Saved.MsgID).
+		Scan(&retiredEventCount); err != nil || retiredEventCount != 1 {
+		t.Fatalf("retired transfer source event count=%d err=%v", retiredEventCount, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM dispatch_outbox
+WHERE target_user_id=$1 AND pts=$2 AND event_type='edit_message'`, resaleBuyer.ID, retiredSourcePTS).
+		Scan(&retiredOutboxCount); err != nil || retiredOutboxCount != 1 {
+		t.Fatalf("retired transfer source outbox count=%d err=%v", retiredOutboxCount, err)
+	}
+	clearedUser, found, err := users.ByID(ctx, resaleBuyer.ID)
+	if err != nil || !found || !clearedUser.EmojiStatus().Empty() {
+		t.Fatalf("transferred collectible status was not cleared: user=%+v found=%v err=%v", clearedUser, found, err)
+	}
+	statusEvents, err := updateEvents.ListAfter(ctx, resaleBuyer.ID, statusPtsBeforeTransfer, 20)
+	if err != nil {
+		t.Fatalf("load collectible invalidation event: %v", err)
+	}
+	var clearEvent domain.UpdateEvent
+	for _, event := range statusEvents {
+		if event.Type == domain.UpdateEventUserEmojiStatus {
+			clearEvent = event
+			break
+		}
+	}
+	if clearEvent.Pts == 0 || !clearEvent.EmojiStatus.Empty() || clearEvent.Peer != (domain.Peer{Type: domain.PeerTypeUser, ID: resaleBuyer.ID}) {
+		t.Fatalf("collectible invalidation event = %+v", clearEvent)
+	}
+	var clearOutboxCount int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM dispatch_outbox
+WHERE target_user_id=$1 AND pts=$2 AND event_type='user_emoji_status'`, resaleBuyer.ID, clearEvent.Pts).Scan(&clearOutboxCount); err != nil || clearOutboxCount != 1 {
+		t.Fatalf("collectible invalidation outbox count=%d err=%v, want 1", clearOutboxCount, err)
+	}
+
+	// A second prepaid collectible contributes its configured craft chance. Success
+	// preserves the first aggregate as crafted and burns the other input. The
+	// fresh payment intent must create another gift even though buyer, owner and
+	// catalog gift are identical to the first purchase.
+	secondPurchaseReq := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: buyer.ID, To: ownerPeer,
+		GiftID: entry.Gift.ID, IncludeUpgrade: true, CommandKey: "purchase-second-" + suffix, Date: now + 145})
+	secondPurchase, err := lifecycle.PurchaseStarGift(ctx, secondPurchaseReq)
+	if err != nil {
+		t.Fatalf("purchase second prepaid gift: %v", err)
+	}
+	prepaidAction := secondPurchase.Send.RecipientMessage.Media.ServiceAction.StarGift
+	if prepaidAction == nil || !prepaidAction.PrepaidUpgrade || prepaidAction.UpgradePriceStars != 100 || prepaidAction.UpgradeStars != 100 {
+		t.Fatalf("prepaid purchase action lost price/entitlement split: %+v", prepaidAction)
+	}
+	secondUpgrade, err := upgrades.UpgradeStarGift(ctx, domain.StarGiftUpgradeRequest{UserID: owner.ID,
+		Ref: domain.SavedStarGiftRef{Owner: ownerPeer, MsgID: secondPurchase.Saved.MsgID}, RequirePrepaid: true,
+		CommandKey: "upgrade-second-" + suffix, Date: now + 146,
+	})
+	if err != nil {
+		t.Fatalf("upgrade second prepaid gift: %v", err)
+	}
+	listedForCraft, err := lifecycle.SetStarGiftListing(ctx, domain.StarGiftListingRequest{ActorUserID: owner.ID,
+		Ref:    domain.SavedStarGiftRef{Owner: ownerPeer, MsgID: transferred.Saved.MsgID},
+		Amount: &domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 125}, Date: now + 146,
+	})
+	if err != nil || listedForCraft.ResellAmount == nil || listedForCraft.ResellAmount.Amount != 125 {
+		t.Fatalf("list craft input = %+v err %v", listedForCraft, err)
+	}
+	loserBalanceBeforeOffer, err := stars.GetBalance(ctx, loser.ID)
+	if err != nil {
+		t.Fatalf("craft offer buyer balance: %v", err)
+	}
+	pendingCraftOffer, err := lifecycle.SendStarGiftOffer(ctx, domain.StarGiftOfferRequest{BuyerUserID: loser.ID,
+		Owner: ownerPeer, Slug: transferred.Unique.Slug,
+		Price:    domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 125},
+		Duration: 120, RandomID: 22003, Date: now + 146,
+	})
+	if err != nil || pendingCraftOffer.Offer.Status != "pending" {
+		t.Fatalf("pending craft offer = %+v err %v", pendingCraftOffer, err)
+	}
+	resolvedCraftIDs, err := gifts.ResolveSavedIDs(ctx, ownerPeer, []domain.SavedStarGiftRef{
+		{Owner: ownerPeer, MsgID: transferred.Saved.MsgID},
+		{Owner: ownerPeer, Slug: secondUpgrade.Unique.Slug},
+	})
+	if err != nil || len(resolvedCraftIDs) != 2 || resolvedCraftIDs[0] != transferred.Saved.ID || resolvedCraftIDs[1] != secondUpgrade.Saved.ID {
+		t.Fatalf("resolve mixed craft refs = %v err %v", resolvedCraftIDs, err)
+	}
+	if _, err := gifts.ResolveSavedIDs(ctx, ownerPeer, []domain.SavedStarGiftRef{
+		{Owner: ownerPeer, MsgID: secondUpgrade.Saved.UpgradeMsgID},
+		{Owner: ownerPeer, Slug: secondUpgrade.Unique.Slug},
+	}); !errors.Is(err, domain.ErrStarGiftCollectibleInvalid) {
+		t.Fatalf("duplicate upgrade output/slug identities err = %v", err)
+	}
+	if saved, found, err := gifts.GetByRef(ctx, domain.SavedStarGiftRef{
+		Owner: ownerPeer, MsgID: secondUpgrade.Saved.UpgradeMsgID,
+	}); err != nil || !found || saved.ID != secondUpgrade.Saved.ID {
+		t.Fatalf("upgrade output message id failed to resolve: saved=%+v found=%v err=%v", saved, found, err)
+	}
+	if _, err := gifts.ResolveSavedIDs(ctx, ownerPeer, []domain.SavedStarGiftRef{
+		{Owner: ownerPeer, MsgID: secondUpgrade.Saved.MsgID},
+		{Owner: ownerPeer, Slug: secondUpgrade.Unique.Slug},
+	}); !errors.Is(err, domain.ErrStarGiftCollectibleInvalid) {
+		t.Fatalf("duplicate official identities err = %v", err)
+	}
+	// The first input survives a successful craft. An on-chain gift address
+	// identifies the immutable NFT payload, so it must never be retained while
+	// the server swaps that input to a crafted model. TDesktop applies the same
+	// first-slot guard before sending the RPC; keep the store authoritative for
+	// older clients and direct callers.
+	// 上链必须同时把 saved 聚合标为 exported：unique_star_gift_owner_guard
+	// 约束触发器要求 unique 行与聚合行一致，两次写在同一个显式事务里提交。
+	addressed := "EQCraftBaseMustStayImmutable"
+	markAddressedTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin addressed mark: %v", err)
+	}
+	if _, err := markAddressedTx.Exec(ctx, `UPDATE unique_star_gifts SET owner_peer_type=NULL,owner_peer_id=NULL,
+owner_address=$2,gift_address=$3,craft_chance_permille=0 WHERE id=$1`, transferred.Unique.ID, addressed, addressed); err != nil {
+		_ = markAddressedTx.Rollback(ctx)
+		t.Fatalf("mark first craft input addressed: %v", err)
+	}
+	if _, err := markAddressedTx.Exec(ctx, `UPDATE peer_star_gifts
+SET lifecycle_status='exported',unsaved=true,pinned_order=0,can_craft_at=0 WHERE unique_gift_id=$1`,
+		transferred.Unique.ID); err != nil {
+		_ = markAddressedTx.Rollback(ctx)
+		t.Fatalf("mark first craft input aggregate exported: %v", err)
+	}
+	if err := markAddressedTx.Commit(ctx); err != nil {
+		t.Fatalf("commit addressed mark: %v", err)
+	}
+	addressedReq := domain.StarGiftCraftRequest{UserID: owner.ID,
+		Refs: []domain.SavedStarGiftRef{
+			{Owner: ownerPeer, MsgID: transferred.Saved.MsgID},
+			{Owner: ownerPeer, Slug: secondUpgrade.Unique.Slug},
+		}, CommandKey: "craft-addressed-" + suffix, Date: now + 147,
+	}
+	if _, err := lifecycle.CraftStarGift(ctx, addressedReq); !errors.Is(err, domain.ErrStarGiftCraftUnavailable) {
+		t.Fatalf("craft accepted addressed first input: %v", err)
+	}
+	var addressedBurned bool
+	if err := pool.QueryRow(ctx, `SELECT burned FROM unique_star_gifts WHERE id=$1`, transferred.Unique.ID).
+		Scan(&addressedBurned); err != nil || addressedBurned {
+		t.Fatalf("addressed craft guard mutated input: burned=%v err=%v", addressedBurned, err)
+	}
+	restoreTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin addressed restore: %v", err)
+	}
+	if _, err := restoreTx.Exec(ctx, `UPDATE unique_star_gifts SET owner_peer_type=$2,owner_peer_id=$3,
+owner_address='',gift_address='',craft_chance_permille=$4 WHERE id=$1`, transferred.Unique.ID,
+		string(transferred.Unique.Owner.Type), transferred.Unique.Owner.ID, transferred.Unique.CraftChancePermille); err != nil {
+		_ = restoreTx.Rollback(ctx)
+		t.Fatalf("restore first craft input address: %v", err)
+	}
+	if _, err := restoreTx.Exec(ctx, `UPDATE peer_star_gifts
+SET lifecycle_status=$2,unsaved=$3,pinned_order=$4,can_craft_at=$5 WHERE unique_gift_id=$1`,
+		transferred.Unique.ID, string(transferred.Saved.LifecycleStatus), transferred.Saved.Unsaved,
+		transferred.Saved.PinnedOrder, transferred.Saved.CanCraftAt); err != nil {
+		_ = restoreTx.Rollback(ctx)
+		t.Fatalf("restore first craft input aggregate: %v", err)
+	}
+	if err := restoreTx.Commit(ctx); err != nil {
+		t.Fatalf("commit addressed restore: %v", err)
+	}
+	crafted, err := lifecycle.CraftStarGift(ctx, domain.StarGiftCraftRequest{UserID: owner.ID,
+		Refs: []domain.SavedStarGiftRef{
+			{Owner: ownerPeer, MsgID: transferred.Saved.MsgID},
+			// TDesktop sends collectibles without a manage id as the official
+			// inputSavedStarGiftSlug alias.
+			{Owner: ownerPeer, Slug: secondUpgrade.Unique.Slug},
+		}, CommandKey: "craft-" + suffix, Date: now + 147,
+	})
+	if err != nil || !crafted.Success || crafted.Chance != 1000 || crafted.Gift == nil || !crafted.Gift.Crafted || crafted.Send.RecipientMessage.ID <= 0 {
+		t.Fatalf("craft result = %+v err %v", crafted, err)
+	}
+	craftOutputAction := crafted.Send.SenderMessage.Media.ServiceAction.StarGiftUnique
+	if craftOutputAction == nil || craftOutputAction.Peer.Type != "" || craftOutputAction.Peer.ID != 0 || craftOutputAction.SavedID != 0 || !craftOutputAction.Craft {
+		t.Fatalf("craft output action leaked channel identity: %+v", craftOutputAction)
+	}
+	if byOutput, found, err := gifts.GetByRef(ctx, domain.SavedStarGiftRef{
+		Owner: ownerPeer, MsgID: crafted.Send.SenderMessage.ID,
+	}); err != nil || !found || byOutput.ID != transferred.Saved.ID || byOutput.UniqueGiftID != crafted.Gift.ID {
+		t.Fatalf("craft output message ref = %+v found %v err %v", byOutput, found, err)
+	}
+	craftedInputEdit := craftedSourceEditForUserAndGift(crafted, owner.ID, transferred.Unique.ID)
+	craftedInputAction := starGiftUniqueActionFromEdit(craftedInputEdit)
+	burnedInputEdit := craftedSourceEditForUserAndGift(crafted, owner.ID, secondUpgrade.Unique.ID)
+	burnedInputAction := starGiftUniqueActionFromEdit(burnedInputEdit)
+	if craftedInputAction == nil || !craftedInputAction.Gift.Crafted || craftedInputAction.Gift.Burned ||
+		craftedInputAction.Gift.CraftChancePermille != 0 || craftedInputAction.Gift.OfferMinStars != 0 ||
+		!craftedInputAction.Saved || craftedInputAction.CanCraftAt != 0 {
+		t.Fatalf("crafted input message projection = %+v", craftedInputAction)
+	}
+	if burnedInputAction == nil || !burnedInputAction.Gift.Burned || burnedInputAction.Gift.CraftChancePermille != 0 ||
+		burnedInputAction.Saved || burnedInputAction.CanCraftAt != 0 {
+		t.Fatalf("burned input message projection = %+v", burnedInputAction)
+	}
+	for _, edit := range []domain.EditedMessageForUser{craftedInputEdit, burnedInputEdit} {
+		var sharedCraftInputMediaJSON string
+		if err := pool.QueryRow(ctx, `SELECT p.media::text FROM private_messages p
+JOIN message_boxes b ON b.message_sender_id=p.sender_user_id AND b.private_message_id=p.id
+WHERE b.owner_user_id=$1 AND b.box_id=$2`, owner.ID, edit.Message.ID).Scan(&sharedCraftInputMediaJSON); err != nil {
+			t.Fatalf("load shared craft input media for box %d: %v", edit.Message.ID, err)
+		}
+		sharedCraftInputMedia, err := decodeMessageMedia(sharedCraftInputMediaJSON)
+		if err != nil || sharedCraftInputMedia == nil || sharedCraftInputMedia.ServiceAction == nil ||
+			sharedCraftInputMedia.ServiceAction.StarGiftUnique == nil ||
+			sharedCraftInputMedia.ServiceAction.StarGiftUnique.SavedID != 0 {
+			t.Fatalf("shared craft input retained account-local saved_id for box %d: media=%+v err=%v",
+				edit.Message.ID, sharedCraftInputMedia, err)
+		}
+	}
+	craftReq := domain.StarGiftCraftRequest{UserID: owner.ID,
+		Refs: []domain.SavedStarGiftRef{
+			{Owner: ownerPeer, MsgID: transferred.Saved.MsgID},
+			{Owner: ownerPeer, Slug: secondUpgrade.Unique.Slug},
+		}, CommandKey: "craft-" + suffix, Date: now + 147,
+	}
+	craftedReplay, err := lifecycle.CraftStarGift(ctx, craftReq)
+	if err != nil || !craftedReplay.Duplicate || !craftedReplay.Success || craftedReplay.Gift == nil ||
+		craftedReplay.Send.RecipientMessage.ID != crafted.Send.RecipientMessage.ID ||
+		craftedSourceEditForUserAndGift(craftedReplay, owner.ID, transferred.Unique.ID).Event.Pts != craftedInputEdit.Event.Pts ||
+		craftedSourceEditForUserAndGift(craftedReplay, owner.ID, secondUpgrade.Unique.ID).Event.Pts != burnedInputEdit.Event.Pts {
+		t.Fatalf("craft success replay = %+v err %v", craftedReplay, err)
+	}
+	craftOutputRef := domain.SavedStarGiftRef{Owner: ownerPeer, MsgID: crafted.Send.SenderMessage.ID}
+	if changed, err := gifts.SetUnsaved(ctx, craftOutputRef, true); err != nil || !changed {
+		t.Fatalf("hide crafted output before replay: changed=%v err=%v", changed, err)
+	}
+	hiddenReplay, err := lifecycle.CraftStarGift(ctx, craftReq)
+	if err != nil || !hiddenReplay.Duplicate || hiddenReplay.Send.SenderMessage.ID != crafted.Send.SenderMessage.ID {
+		t.Fatalf("craft replay after hide = %+v err %v", hiddenReplay, err)
+	}
+	if changed, err := gifts.SetUnsaved(ctx, craftOutputRef, false); err != nil || !changed {
+		t.Fatalf("restore crafted output before listing replay: changed=%v err=%v", changed, err)
+	}
+	listedCraftOutput, err := lifecycle.SetStarGiftListing(ctx, domain.StarGiftListingRequest{ActorUserID: owner.ID,
+		Ref: craftOutputRef, Amount: &domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 125}, Date: now + 148,
+	})
+	if err != nil || listedCraftOutput.ResellAmount == nil || listedCraftOutput.ResellAmount.Amount != 125 {
+		t.Fatalf("list crafted output before replay = %+v err %v", listedCraftOutput, err)
+	}
+	listedReplay, err := lifecycle.CraftStarGift(ctx, craftReq)
+	if err != nil || !listedReplay.Duplicate || listedReplay.Gift == nil || listedReplay.Gift.ResellAmount != nil ||
+		listedReplay.Send.SenderMessage.ID != crafted.Send.SenderMessage.ID {
+		t.Fatalf("craft replay after listing did not use frozen output = %+v err %v", listedReplay, err)
+	}
+	if _, err := lifecycle.SetStarGiftListing(ctx, domain.StarGiftListingRequest{ActorUserID: owner.ID,
+		Ref: craftOutputRef, Date: now + 149,
+	}); err != nil {
+		t.Fatalf("remove crafted output listing: %v", err)
+	}
+	var outputReceiptMedia string
+	var outputReceiptFingerprint []byte
+	if err := pool.QueryRow(ctx, `SELECT output_media::text,output_fingerprint FROM star_gift_craft_commands
+WHERE user_id=$1 AND command_key=$2`, owner.ID, craftReq.CommandKey).Scan(&outputReceiptMedia, &outputReceiptFingerprint); err != nil ||
+		outputReceiptMedia == "" || len(outputReceiptFingerprint) != 32 {
+		t.Fatalf("craft immutable output receipt: media=%q fingerprint=%d err=%v", outputReceiptMedia, len(outputReceiptFingerprint), err)
+	}
+	var craftListings, resaleAvailability int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM star_gift_listings WHERE unique_gift_id=ANY($1::bigint[])`,
+		[]int64{transferred.Unique.ID, secondUpgrade.Unique.ID}).Scan(&craftListings); err != nil || craftListings != 0 {
+		t.Fatalf("craft input listings = %d err %v", craftListings, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT availability_resale FROM star_gift_catalog WHERE gift_id=$1`, entry.Gift.ID).Scan(&resaleAvailability); err != nil || resaleAvailability != 0 {
+		t.Fatalf("craft resale projection = %d err %v", resaleAvailability, err)
+	}
+	var craftOfferStatus string
+	if err := pool.QueryRow(ctx, `SELECT status FROM star_gift_offers WHERE id=$1`, pendingCraftOffer.Offer.ID).Scan(&craftOfferStatus); err != nil || craftOfferStatus != "cancelled" {
+		t.Fatalf("craft offer status = %q err %v", craftOfferStatus, err)
+	}
+	loserBalanceAfterCraft, err := stars.GetBalance(ctx, loser.ID)
+	if err != nil || loserBalanceAfterCraft.Balance != loserBalanceBeforeOffer.Balance {
+		t.Fatalf("craft offer refund balance = %+v err %v, want %d", loserBalanceAfterCraft, err, loserBalanceBeforeOffer.Balance)
+	}
+	var secondStatus string
+	if err := pool.QueryRow(ctx, `SELECT lifecycle_status FROM peer_star_gifts WHERE id=$1`, secondUpgrade.Saved.ID).Scan(&secondStatus); err != nil || secondStatus != "burned" {
+		t.Fatalf("second craft input status = %q err %v", secondStatus, err)
+	}
+
+	// A failed draw is just as terminal as success: the input aggregate and both
+	// users' message snapshots are burned in the outcome transaction. An exact
+	// retry replays the receipt, while a fresh command cannot consume it again.
+	thirdPurchaseReq := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: buyer.ID, To: ownerPeer,
+		GiftID: entry.Gift.ID, IncludeUpgrade: true, CommandKey: "purchase-third-" + suffix, Date: now + 148})
+	thirdPurchase, err := lifecycle.PurchaseStarGift(ctx, thirdPurchaseReq)
+	if err != nil {
+		t.Fatalf("purchase third prepaid gift: %v", err)
+	}
+	thirdUpgrade, err := upgrades.UpgradeStarGift(ctx, domain.StarGiftUpgradeRequest{UserID: owner.ID,
+		Ref: domain.SavedStarGiftRef{Owner: ownerPeer, MsgID: thirdPurchase.Saved.MsgID}, RequirePrepaid: true,
+		CommandKey: "upgrade-third-" + suffix, Date: now + 149,
+	})
+	if err != nil {
+		t.Fatalf("upgrade third prepaid gift: %v", err)
+	}
+	failingLifecycle := NewStarGiftLifecycleStore(pool, messages, 1_000_000,
+		WithStarGiftMarketPolicy(domain.StarGiftMarketPolicy{StarsProceedsPermille: 900, TONProceedsPermille: 900}),
+		WithStarGiftCraftDraw(func(upper int) (int, error) { return upper - 1, nil }))
+	failureReq := domain.StarGiftCraftRequest{UserID: owner.ID,
+		Refs:       []domain.SavedStarGiftRef{{Owner: ownerPeer, MsgID: thirdUpgrade.Saved.UpgradeMsgID}},
+		CommandKey: "craft-fail-" + suffix, Date: now + 150,
+	}
+	failedCraft, err := failingLifecycle.CraftStarGift(ctx, failureReq)
+	if err != nil || failedCraft.Success || failedCraft.Chance != 500 || failedCraft.Gift != nil {
+		t.Fatalf("craft failure result = %+v err %v", failedCraft, err)
+	}
+	failedInputEdit := craftedSourceEditForUserAndGift(failedCraft, owner.ID, thirdUpgrade.Unique.ID)
+	failedInputAction := starGiftUniqueActionFromEdit(failedInputEdit)
+	if failedInputAction == nil || !failedInputAction.Gift.Burned || failedInputAction.Gift.CraftChancePermille != 0 ||
+		failedInputAction.Gift.OfferMinStars != 0 || failedInputAction.Saved || failedInputAction.CanCraftAt != 0 {
+		t.Fatalf("failed craft message projection = %+v", failedInputAction)
+	}
+	var failedLifecycle string
+	var failedUnsaved bool
+	var failedTransferStars int64
+	var failedCanExportAt, failedCanTransferAt, failedCanResellAt, failedCanCraftAt int
+	var failedDropStars int64
+	if err := pool.QueryRow(ctx, `SELECT lifecycle_status,unsaved,transfer_stars,can_export_at,can_transfer_at,
+can_resell_at,drop_original_details_stars,can_craft_at FROM peer_star_gifts WHERE id=$1`, thirdUpgrade.Saved.ID).
+		Scan(&failedLifecycle, &failedUnsaved, &failedTransferStars, &failedCanExportAt, &failedCanTransferAt,
+			&failedCanResellAt, &failedDropStars, &failedCanCraftAt); err != nil || failedLifecycle != "burned" || !failedUnsaved ||
+		failedTransferStars != 0 || failedCanExportAt != 0 || failedCanTransferAt != 0 || failedCanResellAt != 0 ||
+		failedDropStars != 0 || failedCanCraftAt != 0 {
+		t.Fatalf("failed craft saved aggregate = status %q unsaved %v transfer %d export %d transfer_at %d resale %d drop %d craft %d err %v",
+			failedLifecycle, failedUnsaved, failedTransferStars, failedCanExportAt, failedCanTransferAt,
+			failedCanResellAt, failedDropStars, failedCanCraftAt, err)
+	}
+	var failedBurned bool
+	var failedChance, failedOfferMin int
+	if err := pool.QueryRow(ctx, `SELECT burned,craft_chance_permille,offer_min_stars FROM unique_star_gifts WHERE id=$1`, thirdUpgrade.Unique.ID).
+		Scan(&failedBurned, &failedChance, &failedOfferMin); err != nil || !failedBurned || failedChance != 0 || failedOfferMin != 0 {
+		t.Fatalf("failed craft unique aggregate = burned %v chance %d offer %d err %v", failedBurned, failedChance, failedOfferMin, err)
+	}
+	failedReplay, err := failingLifecycle.CraftStarGift(ctx, failureReq)
+	if err != nil || !failedReplay.Duplicate || failedReplay.Success || failedReplay.Chance != failedCraft.Chance ||
+		craftedSourceEditForUserAndGift(failedReplay, owner.ID, thirdUpgrade.Unique.ID).Event.Pts != failedInputEdit.Event.Pts {
+		t.Fatalf("craft failure replay = %+v err %v", failedReplay, err)
+	}
+	wrongAliasReplay := failureReq
+	wrongAliasReplay.Refs = []domain.SavedStarGiftRef{{Owner: ownerPeer, MsgID: secondUpgrade.Saved.UpgradeMsgID}}
+	if _, err := failingLifecycle.CraftStarGift(ctx, wrongAliasReplay); !errors.Is(err, domain.ErrStarGiftCraftUnavailable) {
+		t.Fatalf("craft replay accepted another aggregate alias: %v", err)
+	}
+	invalidRetry := failureReq
+	invalidRetry.CommandKey = "craft-fail-new-command-" + suffix
+	if _, err := failingLifecycle.CraftStarGift(ctx, invalidRetry); !errors.Is(err, domain.ErrStarGiftCraftUnavailable) {
+		t.Fatalf("fresh command reused burned craft input: %v", err)
+	}
+	craftCandidates, err := lifecycle.ListCraftStarGifts(ctx, owner.ID, entry.Gift.ID, "", 20)
+	if err != nil || craftCandidates.Count != 0 || len(craftCandidates.Gifts) != 0 {
+		t.Fatalf("terminal craft inputs remained candidates: %+v err %v", craftCandidates, err)
+	}
+
+	withdrawalReq := domain.StarGiftWithdrawalRequest{UserID: owner.ID,
+		Ref: domain.SavedStarGiftRef{Owner: ownerPeer, MsgID: transferred.Saved.MsgID}, Date: now + 151}
+	recorded, err := lifecycle.RecordStarGiftWithdrawal(ctx, withdrawalReq, "local", "withdraw-"+suffix,
+		"https://telesrv.invalid/gift-withdrawal/"+suffix, now+748)
+	if err != nil || recorded.Status != "pending" {
+		t.Fatalf("record local withdrawal = %+v err %v", recorded, err)
+	}
+	completed, err := lifecycle.CompleteStarGiftWithdrawal(ctx, recorded.ProviderRequestID, now+152)
+	if err != nil || completed.Status != "completed" || completed.Gift.OwnerAddress == "" || completed.Gift.GiftAddress == "" {
+		t.Fatalf("complete local withdrawal = %+v err %v", completed, err)
+	}
+	// A TON transfer changes both the wallet projection and the profile host.
+	// The former profile must lose the gift until the new wallet owner proves
+	// ownership through @claim.
+	if _, err := pool.Exec(ctx, `UPDATE unique_star_gifts SET host_peer_type='user',host_peer_id=$2 WHERE id=$1`,
+		transferred.Unique.ID, owner.ID); err != nil {
+		t.Fatalf("stage claimed exported gift: %v", err)
+	}
+	claimStore := NewStarGiftClaimStore(pool)
+	newWallet := "0:" + strings.Repeat("ab", 32)
+	changed, err := claimStore.ReconcileOnChainOwner(ctx, transferred.Unique.ID, completed.Gift.GiftAddress,
+		completed.Gift.OwnerAddress, newWallet)
+	if err != nil || !changed {
+		t.Fatalf("reconcile TON owner = changed %v err %v", changed, err)
+	}
+	var reconciledWallet, reconciledHostType string
+	var reconciledHostID int64
+	if err := pool.QueryRow(ctx, `SELECT owner_address,host_peer_type,host_peer_id FROM unique_star_gifts WHERE id=$1`,
+		transferred.Unique.ID).Scan(&reconciledWallet, &reconciledHostType, &reconciledHostID); err != nil ||
+		reconciledWallet != newWallet || reconciledHostType != "user" || reconciledHostID != domain.GiftRelayerUserID {
+		t.Fatalf("reconciled TON owner = wallet %q host %s:%d err %v", reconciledWallet, reconciledHostType, reconciledHostID, err)
+	}
+	if changed, err := claimStore.ReconcileOnChainOwner(ctx, transferred.Unique.ID, completed.Gift.GiftAddress,
+		completed.Gift.OwnerAddress, newWallet); err != nil || changed {
+		t.Fatalf("stale TON owner CAS = changed %v err %v", changed, err)
+	}
+	// Once a collectible is on-chain, payments.transferStarGift must never move
+	// the stale server-side projection. Both the free RPC and the paid form end
+	// up in TransferStarGift, so this store-level guard covers every input alias.
+	if _, err := lifecycle.TransferStarGift(ctx, domain.StarGiftTransferRequest{
+		ActorUserID: owner.ID,
+		Ref:         withdrawalReq.Ref,
+		To:          domain.Peer{Type: domain.PeerTypeUser, ID: buyer.ID},
+		CommandKey:  "transfer-exported-" + suffix,
+		Date:        now + 153,
+	}); !errors.Is(err, domain.ErrStarGiftTransferUnavailable) {
+		t.Fatalf("transfer accepted exported gift: %v", err)
+	}
+	// A non-empty item address alone must also fail closed if a repair leaves
+	// the other export projections temporarily live. The deferred aggregate
+	// guard rejects the transient staging itself, so a transfer can never
+	// observe a live saved copy of an addressed collectible.
+	if _, err := pool.Exec(ctx, `UPDATE peer_star_gifts SET lifecycle_status='active' WHERE id=$1`, transferred.Saved.ID); err == nil {
+		t.Fatalf("staging a live saved aggregate under an addressed item was allowed")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE unique_star_gifts SET owner_peer_type='user',owner_peer_id=$2,owner_address='' WHERE id=$1`,
+		transferred.Unique.ID, owner.ID); err == nil {
+		t.Fatalf("staging an addressed item under a non-exported aggregate was allowed")
+	}
+	if _, err := lifecycle.TransferStarGift(ctx, domain.StarGiftTransferRequest{
+		ActorUserID: owner.ID,
+		Ref:         withdrawalReq.Ref,
+		To:          domain.Peer{Type: domain.PeerTypeUser, ID: buyer.ID},
+		CommandKey:  "transfer-addressed-" + suffix,
+		Date:        now + 154,
+	}); !errors.Is(err, domain.ErrStarGiftTransferUnavailable) {
+		t.Fatalf("transfer accepted gift_address-only collectible: %v", err)
+	}
+
+	// Auction winner reservation is consumed; the unreachable lower bid is
+	// refunded atomically. Award delivery is durable and includes gift_num.
+	auctionEntry, err := gifts.CreateCatalogRevision(ctx, domain.StarGiftCatalogWrite{
+		Title: "Auction " + suffix, Stars: 100, Enabled: true, Limited: true, Auction: true,
+		AvailabilityTotal: 1, AvailabilityRemains: 1, GiftsPerRound: 1, AuctionStartDate: now - 10,
+		AuctionSlug: "auction-" + suffix,
+		Document:    collectibleTestDocument(baseDocumentID+100, "auction.tgs"),
+		Blob:        collectibleTestBlob(baseDocumentID+100, "auction"), Animation: collectibleTestAnimation("auction.tgs"),
+		Actor: "integration", CommandID: "auction-catalog-" + suffix,
+	})
+	if err != nil {
+		t.Fatalf("create auction catalog: %v", err)
+	}
+	winnerState, _, err := lifecycle.BidStarGiftAuction(ctx, domain.StarGiftAuctionBidRequest{UserID: resaleBuyer.ID,
+		GiftID: auctionEntry.Gift.ID, Peer: ownerPeer, BidAmount: 200, FormID: 12001, Date: now, Message: "winner"})
+	if err != nil || winnerState.UserState.BidAmount != 200 {
+		t.Fatalf("winner bid state = %+v err %v", winnerState, err)
+	}
+	if _, _, err := lifecycle.BidStarGiftAuction(ctx, domain.StarGiftAuctionBidRequest{UserID: loser.ID,
+		GiftID: auctionEntry.Gift.ID, Peer: domain.Peer{Type: domain.PeerTypeUser, ID: loser.ID},
+		BidAmount: 150, FormID: 12002, Date: now + 1}); err != nil {
+		t.Fatalf("loser bid: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE star_gift_auctions SET next_round_at=$2 WHERE gift_id=$1`, auctionEntry.Gift.ID, now+2); err != nil {
+		t.Fatalf("make auction round due: %v", err)
+	}
+	if err := lifecycle.SweepStarGiftLifecycle(ctx, now+2, 1000); err != nil {
+		t.Fatalf("settle auction sweep: %v", err)
+	}
+	acquired, err := lifecycle.StarGiftAuctionAcquired(ctx, resaleBuyer.ID, auctionEntry.Gift.ID)
+	if err != nil || len(acquired) != 1 || acquired[0].GiftNum != 1 || acquired[0].BidAmount != 200 {
+		t.Fatalf("auction acquired = %+v err %v", acquired, err)
+	}
+	if loserBalance, err := stars.GetBalance(ctx, loser.ID); err != nil || loserBalance.Balance != 10000 {
+		t.Fatalf("auction loser refund = %+v err %v", loserBalance, err)
+	}
+	var auctionSavedCount int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM peer_star_gifts WHERE gift_id=$1 AND gift_num=1 AND convert_stars=0`, auctionEntry.Gift.ID).
+		Scan(&auctionSavedCount); err != nil || auctionSavedCount != 1 {
+		t.Fatalf("auction saved award count = %d err %v", auctionSavedCount, err)
+	}
+	// The award must be priced at the winning bid (200), not at the catalog
+	// starting price (100) that ensureStarGiftAuction reuses as min_bid_amount.
+	var auctionPaidStars int64
+	if err := pool.QueryRow(ctx, `SELECT paid_stars FROM peer_star_gifts WHERE gift_id=$1 AND gift_num=1`,
+		auctionEntry.Gift.ID).Scan(&auctionPaidStars); err != nil || auctionPaidStars != 200 {
+		t.Fatalf("auction award paid_stars = %d want 200 err %v", auctionPaidStars, err)
+	}
+	// The service message carries its own immutable gift snapshot, which is what
+	// the client renders as "won the auction with a bid of N Stars".
+	var awardSnapshotStars int64
+	if err := pool.QueryRow(ctx, `SELECT (media->'service_action'->'star_gift'->>'stars')::bigint
+FROM message_boxes
+WHERE owner_user_id=$1
+  AND (media->'service_action'->'star_gift'->>'gift_id')::bigint=$2
+  AND (media->'service_action'->'star_gift'->>'auction_acquired')='true'`,
+		owner.ID, auctionEntry.Gift.ID).Scan(&awardSnapshotStars); err != nil || awardSnapshotStars != 200 {
+		t.Fatalf("auction award message stars = %d want 200 err %v", awardSnapshotStars, err)
+	}
+
+}
+
+func TestStarGiftOfferRejectsDeletedOwnerPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	suffix := randomSuffix(t)
+	now := int(time.Now().Unix())
+	users := NewUserStore(pool)
+	doomed := createTestUser(t, ctx, users, "+1881"+suffix+"10", "DoomedOwner", "")
+	buyer := createTestUser(t, ctx, users, "+1881"+suffix+"11", "DeletedOfferBuyer", "")
+	doomedPeer := domain.Peer{Type: domain.PeerTypeUser, ID: doomed.ID}
+
+	stars := NewStarsStore(pool)
+	for _, u := range []domain.User{doomed, buyer} {
+		if _, _, err := stars.EnsureGrant(ctx, u.ID, 10000, now); err != nil {
+			t.Fatalf("grant stars to %d: %v", u.ID, err)
+		}
+	}
+
+	gifts := NewStarGiftStore(pool)
+	baseDocumentID := time.Now().UnixNano() & 0x7ffffffffffff000
+	entry, err := gifts.CreateCatalogRevision(ctx, domain.StarGiftCatalogWrite{
+		Title: "Deleted " + suffix, Stars: 50, ConvertStars: 20, Enabled: true,
+		Document: collectibleTestDocument(baseDocumentID, "deleted.tgs"),
+		Blob:     collectibleTestBlob(baseDocumentID, "deleted"), Animation: collectibleTestAnimation("deleted.tgs"),
+		Actor: "integration", CommandID: "deleted-catalog-" + suffix,
+	})
+	if err != nil {
+		t.Fatalf("create deleted-owner catalog: %v", err)
+	}
+	if _, err := gifts.PublishCollectibleRevision(ctx, domain.StarGiftCollectibleWrite{
+		GiftID: entry.Gift.ID, UpgradeStars: 100, SupplyTotal: 4, SlugPrefix: "del-" + suffix,
+		Models: []domain.StarGiftCollectibleAttribute{
+			{Kind: domain.StarGiftCollectibleModel, Name: "Base", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestDocumentPtr(baseDocumentID+1, "deleted-model.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+1, "deleted-model"), Animation: collectibleTestAnimationPtr("deleted-model.tgs")},
+			{Kind: domain.StarGiftCollectibleModel, Name: "Base Two", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestDocumentPtr(baseDocumentID+3, "deleted-model-two.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+3, "deleted-model-two"), Animation: collectibleTestAnimationPtr("deleted-model-two.tgs")},
+		},
+		Patterns: []domain.StarGiftCollectibleAttribute{
+			{Kind: domain.StarGiftCollectiblePattern, Name: "Orbit", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestPatternDocumentPtr(baseDocumentID+2, "deleted-pattern.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+2, "deleted-pattern"), Animation: collectibleTestAnimationPtr("deleted-pattern.tgs")},
+			{Kind: domain.StarGiftCollectiblePattern, Name: "Orbit Two", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestPatternDocumentPtr(baseDocumentID+4, "deleted-pattern-two.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+4, "deleted-pattern-two"), Animation: collectibleTestAnimationPtr("deleted-pattern-two.tgs")},
+		},
+		Backdrops: []domain.StarGiftCollectibleAttribute{
+			{Kind: domain.StarGiftCollectibleBackdrop, Name: "Night", BackdropID: 79, CenterColor: 0x010203, EdgeColor: 0x040506, PatternColor: 0x070809, TextColor: 0x0a0b0c, RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000},
+			{Kind: domain.StarGiftCollectibleBackdrop, Name: "Day", BackdropID: 80, CenterColor: 0x111213, EdgeColor: 0x141516, PatternColor: 0x171819, TextColor: 0x1a1b1c, RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000},
+		},
+		Actor: "integration", CommandID: "deleted-pool-" + suffix,
+	}); err != nil {
+		t.Fatalf("publish deleted-owner pool: %v", err)
+	}
+
+	messages := NewMessageStore(pool)
+	lifecycle := NewStarGiftLifecycleStore(pool, messages, 1_000_000, WithStarGiftMarketPolicy(domain.StarGiftMarketPolicy{
+		StarsProceedsPermille: 900, TONProceedsPermille: 900,
+	}))
+	upgrades := NewStarGiftUpgradeStore(pool, messages, WithStarGiftLifecyclePolicy(domain.StarGiftLifecyclePolicy{
+		TransferStars: 25, DropOriginalDetailsStars: 25, OfferMinStars: 1, CraftChancePermille: 500,
+	}))
+
+	purchaseReq := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: doomed.ID, To: doomedPeer,
+		GiftID: entry.Gift.ID, CommandKey: "deleted-purchase-" + suffix, Date: now, Message: "hello"})
+	purchased, err := lifecycle.PurchaseStarGift(ctx, purchaseReq)
+	if err != nil {
+		t.Fatalf("purchase deleted-owner gift: %v", err)
+	}
+	upgraded, err := upgrades.UpgradeStarGift(ctx, domain.StarGiftUpgradeRequest{
+		UserID: doomed.ID, Ref: domain.SavedStarGiftRef{Owner: doomedPeer, MsgID: purchased.Saved.MsgID},
+		RequirePrepaid: false, ChargeStars: 100, FormID: 92001, KeepOriginalDetails: true,
+		CommandKey: "deleted-upgrade-" + suffix, Date: now + 1,
+	})
+	if err != nil || upgraded.Unique.Slug == "" || upgraded.Unique.Owner != doomedPeer || upgraded.Unique.OfferMinStars <= 0 {
+		t.Fatalf("upgrade deleted-owner gift = %+v err %v", upgraded, err)
+	}
+
+	// The same gift must accept offers while its owner account is alive.
+	live, err := lifecycle.SendStarGiftOffer(ctx, domain.StarGiftOfferRequest{BuyerUserID: buyer.ID, Owner: doomedPeer,
+		Slug: upgraded.Unique.Slug, Price: domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 300},
+		Duration: 120, RandomID: 92002, Date: now + 2})
+	if err != nil || live.Offer.OfferMsgID <= 0 {
+		t.Fatalf("offer while owner alive = %+v err %v", live, err)
+	}
+	if _, err := lifecycle.ResolveStarGiftOffer(ctx, domain.StarGiftResolveOfferRequest{
+		OwnerUserID: doomed.ID, OfferMsgID: live.Offer.OfferMsgID, Decline: true, Date: now + 3,
+	}); err != nil {
+		t.Fatalf("decline pre-freeze offer: %v", err)
+	}
+	if balance, err := stars.GetBalance(ctx, buyer.ID); err != nil || balance.Balance != 10000 {
+		t.Fatalf("declined offer refund = %+v err %v", balance, err)
+	}
+
+	admin := NewAdminStore(pool)
+	freeze := domain.AccountFreeze{UserID: doomed.ID, Frozen: true, Since: time.Unix(int64(now), 0),
+		Until: time.Unix(int64(now)+3600, 0), AppealURL: "https://example.test/" + suffix, Reason: "integration", Actor: "integration", CommandID: "freeze-" + suffix}
+	if _, err := admin.SetAccountFreeze(ctx, freeze); err != nil {
+		t.Fatalf("freeze owner account: %v", err)
+	}
+	if _, err := lifecycle.SendStarGiftOffer(ctx, domain.StarGiftOfferRequest{BuyerUserID: buyer.ID, Owner: doomedPeer,
+		Slug: upgraded.Unique.Slug, Price: domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 300},
+		Duration: 120, RandomID: 92003, Date: now + 4}); !errors.Is(err, domain.ErrStarGiftOfferInvalid) {
+		t.Fatalf("offer against frozen owner = %v, want ErrStarGiftOfferInvalid", err)
+	}
+	if balance, err := stars.GetBalance(ctx, buyer.ID); err != nil || balance.Balance != 10000 {
+		t.Fatalf("frozen-rejected offer must not debit buyer = %+v err %v", balance, err)
+	}
+	var frozenOfferRows int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM star_gift_offers WHERE buyer_user_id=$1 AND random_id=$2`, buyer.ID, int64(92003)).Scan(&frozenOfferRows); err != nil || frozenOfferRows != 0 {
+		t.Fatalf("frozen-rejected offer rows = %d err %v", frozenOfferRows, err)
+	}
+	unfrozen, err := admin.SetAccountFreeze(ctx, domain.AccountFreeze{UserID: doomed.ID, Actor: "integration", CommandID: "unfreeze-" + suffix})
+	if err != nil || unfrozen.Frozen {
+		t.Fatalf("unfreeze owner account = %+v err %v", unfrozen, err)
+	}
+	unfrozenOffer, err := lifecycle.SendStarGiftOffer(ctx, domain.StarGiftOfferRequest{BuyerUserID: buyer.ID, Owner: doomedPeer,
+		Slug: upgraded.Unique.Slug, Price: domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 300},
+		Duration: 120, RandomID: 92005, Date: now + 5})
+	if err != nil || unfrozenOffer.Offer.OfferMsgID <= 0 {
+		t.Fatalf("offer after unfreeze = %+v err %v", unfrozenOffer, err)
+	}
+	if _, err := lifecycle.ResolveStarGiftOffer(ctx, domain.StarGiftResolveOfferRequest{
+		OwnerUserID: doomed.ID, OfferMsgID: unfrozenOffer.Offer.OfferMsgID, Decline: true, Date: now + 5,
+	}); err != nil {
+		t.Fatalf("decline post-unfreeze offer: %v", err)
+	}
+	if balance, err := stars.GetBalance(ctx, buyer.ID); err != nil || balance.Balance != 10000 {
+		t.Fatalf("post-unfreeze declined refund = %+v err %v", balance, err)
+	}
+
+	if _, err := NewAccountLifecycleStore(pool).ExecuteAccountDeletion(ctx, doomed.ID, domain.AccountDeletionManual, "manual", time.Unix(int64(now)+6, 0)); err != nil {
+		t.Fatalf("execute account deletion: %v", err)
+	}
+	if _, err := lifecycle.SendStarGiftOffer(ctx, domain.StarGiftOfferRequest{BuyerUserID: buyer.ID, Owner: doomedPeer,
+		Slug: upgraded.Unique.Slug, Price: domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 300},
+		Duration: 120, RandomID: 92004, Date: now + 7}); !errors.Is(err, domain.ErrStarGiftOfferInvalid) {
+		t.Fatalf("offer against deleted owner = %v, want ErrStarGiftOfferInvalid", err)
+	}
+	if balance, err := stars.GetBalance(ctx, buyer.ID); err != nil || balance.Balance != 10000 {
+		t.Fatalf("rejected offer must not debit buyer = %+v err %v", balance, err)
+	}
+	var extraOffers int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM star_gift_offers WHERE buyer_user_id=$1 AND random_id=$2`, buyer.ID, int64(92004)).Scan(&extraOffers); err != nil || extraOffers != 0 {
+		t.Fatalf("rejected offer rows = %d err %v", extraOffers, err)
+	}
+}
+
+func TestStarGiftPurchaseRejectsFrozenRecipientPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	suffix := randomSuffix(t)
+	now := int(time.Now().Unix())
+	users := NewUserStore(pool)
+	buyer := createTestUser(t, ctx, users, "+1881"+suffix+"60", "FrozenGiftBuyer", "")
+	recipient := createTestUser(t, ctx, users, "+1881"+suffix+"61", "FrozenGiftRecipient", "")
+	recipientPeer := domain.Peer{Type: domain.PeerTypeUser, ID: recipient.ID}
+
+	stars := NewStarsStore(pool)
+	if _, _, err := stars.EnsureGrant(ctx, buyer.ID, 10000, now); err != nil {
+		t.Fatalf("grant buyer stars: %v", err)
+	}
+	gifts := NewStarGiftStore(pool)
+	baseDocumentID := time.Now().UnixNano() & 0x7ffffffffffff000
+	entry, err := gifts.CreateCatalogRevision(ctx, domain.StarGiftCatalogWrite{
+		Title: "Frozen Recipient " + suffix, Stars: 50, ConvertStars: 20, Enabled: true,
+		Document: collectibleTestDocument(baseDocumentID, "frozen-recipient.tgs"),
+		Blob:     collectibleTestBlob(baseDocumentID, "frozen-recipient"), Animation: collectibleTestAnimation("frozen-recipient.tgs"),
+		Actor: "integration", CommandID: "frozen-recipient-catalog-" + suffix,
+	})
+	if err != nil {
+		t.Fatalf("create frozen-recipient catalog: %v", err)
+	}
+	messages := NewMessageStore(pool)
+	lifecycle := NewStarGiftLifecycleStore(pool, messages, 1_000_000, WithStarGiftMarketPolicy(domain.StarGiftMarketPolicy{
+		StarsProceedsPermille: 900, TONProceedsPermille: 900,
+	}))
+	// A live recipient accepts the gift to prove the baseline flow works.
+	liveReq := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: buyer.ID, To: recipientPeer,
+		GiftID: entry.Gift.ID, CommandKey: "frozen-recipient-live-" + suffix, Date: now, Message: "hello"})
+	live, err := lifecycle.PurchaseStarGift(ctx, liveReq)
+	if err != nil || live.Saved.MsgID <= 0 {
+		t.Fatalf("purchase to live recipient = %+v err %v", live, err)
+	}
+
+	admin := NewAdminStore(pool)
+	freeze := domain.AccountFreeze{UserID: recipient.ID, Frozen: true, Since: time.Unix(int64(now), 0),
+		Until: time.Unix(int64(now)+3600, 0), AppealURL: "https://example.test/" + suffix, Reason: "integration", Actor: "integration", CommandID: "freeze-recipient-" + suffix}
+	if _, err := admin.SetAccountFreeze(ctx, freeze); err != nil {
+		t.Fatalf("freeze recipient account: %v", err)
+	}
+	frozenReq := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: buyer.ID, To: recipientPeer,
+		GiftID: entry.Gift.ID, CommandKey: "frozen-recipient-send-" + suffix, Date: now + 2, Message: "hello"})
+	if _, err := lifecycle.PurchaseStarGift(ctx, frozenReq); !errors.Is(err, domain.ErrStarGiftRecipientUnavailable) {
+		t.Fatalf("purchase to frozen recipient = %v, want ErrStarGiftRecipientUnavailable", err)
+	}
+	if balance, err := stars.GetBalance(ctx, buyer.ID); err != nil || balance.Balance != 9950 {
+		t.Fatalf("frozen-rejected purchase must not debit buyer = %+v err %v", balance, err)
+	}
+	var frozenGiftRows int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM peer_star_gifts WHERE owner_peer_type='user' AND owner_peer_id=$1 AND from_user_id=$2`, recipient.ID, buyer.ID).Scan(&frozenGiftRows); err != nil || frozenGiftRows != 1 {
+		t.Fatalf("frozen-rejected purchase must not add saved gifts = %d err %v", frozenGiftRows, err)
+	}
+
+	if unfrozen, err := admin.SetAccountFreeze(ctx, domain.AccountFreeze{UserID: recipient.ID, Actor: "integration", CommandID: "unfreeze-recipient-" + suffix}); err != nil || unfrozen.Frozen {
+		t.Fatalf("unfreeze recipient account = %+v err %v", unfrozen, err)
+	}
+	liveAgain, err := lifecycle.PurchaseStarGift(ctx, issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: buyer.ID, To: recipientPeer,
+		GiftID: entry.Gift.ID, CommandKey: "frozen-recipient-live-again-" + suffix, Date: now + 3, Message: "hello"}))
+	if err != nil || liveAgain.Saved.MsgID <= 0 {
+		t.Fatalf("purchase after unfreeze = %+v err %v", liveAgain, err)
+	}
+}
+
+func TestStarGiftChannelLifecycleAtomicPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	suffix := randomSuffix(t)
+	now := int(time.Now().Unix())
+	users := NewUserStore(pool)
+	actor := createTestUser(t, ctx, users, "+1882"+suffix+"01", "ChannelGiftActor", "")
+	notifyAdmin := createTestUser(t, ctx, users, "+1882"+suffix+"02", "ChannelGiftNotifyAdmin", "")
+	mutedAdmin := createTestUser(t, ctx, users, "+1882"+suffix+"03", "ChannelGiftMutedAdmin", "")
+	noPostAdmin := createTestUser(t, ctx, users, "+1882"+suffix+"04", "ChannelGiftNoPostAdmin", "")
+	ordinaryMember := createTestUser(t, ctx, users, "+1882"+suffix+"05", "ChannelGiftMember", "")
+	if _, _, err := NewStarsStore(pool).EnsureGrant(ctx, actor.ID, 10000, now); err != nil {
+		t.Fatalf("grant actor stars: %v", err)
+	}
+	channelStore := NewChannelStore(pool)
+	created, err := channelStore.CreateChannel(ctx, domain.CreateChannelRequest{
+		CreatorUserID: actor.ID, Title: "Gift Channel " + suffix, Megagroup: true, Date: now,
+		MemberUserIDs: []int64{notifyAdmin.ID, mutedAdmin.ID, noPostAdmin.ID, ordinaryMember.ID},
+	})
+	if err != nil {
+		t.Fatalf("create gift channel: %v", err)
+	}
+	for _, admin := range []domain.User{notifyAdmin, mutedAdmin} {
+		if _, err := channelStore.EditChannelAdmin(ctx, domain.EditChannelAdminRequest{
+			UserID: actor.ID, ChannelID: created.Channel.ID, MemberID: admin.ID,
+			AdminRights: domain.ChannelAdminRights{PostMessages: true}, Date: now,
+		}); err != nil {
+			t.Fatalf("grant channel gift PostMessages admin %d: %v", admin.ID, err)
+		}
+	}
+	if _, err := channelStore.EditChannelAdmin(ctx, domain.EditChannelAdminRequest{
+		UserID: actor.ID, ChannelID: created.Channel.ID, MemberID: noPostAdmin.ID,
+		AdminRights: domain.ChannelAdminRights{ChangeInfo: true}, Date: now,
+	}); err != nil {
+		t.Fatalf("grant non-posting channel admin: %v", err)
+	}
+	channelPeer := domain.Peer{Type: domain.PeerTypeChannel, ID: created.Channel.ID}
+	createdTarget, err := channelStore.CreateChannel(ctx, domain.CreateChannelRequest{
+		CreatorUserID: actor.ID, Title: "Gift Target Channel " + suffix, Megagroup: true, Date: now,
+	})
+	if err != nil {
+		t.Fatalf("create target gift channel: %v", err)
+	}
+	targetChannelPeer := domain.Peer{Type: domain.PeerTypeChannel, ID: createdTarget.Channel.ID}
+	gifts := NewStarGiftStore(pool)
+	baseDocumentID := (time.Now().UnixNano() & 0x7ffffffffffff000) + 500
+	entry, err := gifts.CreateCatalogRevision(ctx, domain.StarGiftCatalogWrite{
+		Title: "Channel Gift " + suffix, Stars: 50, ConvertStars: 20, Enabled: true, Limited: true,
+		AvailabilityTotal: 5, AvailabilityRemains: 5,
+		Document: collectibleTestDocument(baseDocumentID, "channel-gift.tgs"), Blob: collectibleTestBlob(baseDocumentID, "channel-gift"),
+		Animation: collectibleTestAnimation("channel-gift.tgs"), Actor: "integration", CommandID: "channel-gift-" + suffix,
+	})
+	if err != nil {
+		t.Fatalf("create channel gift catalog: %v", err)
+	}
+	if _, err := gifts.PublishCollectibleRevision(ctx, domain.StarGiftCollectibleWrite{
+		GiftID: entry.Gift.ID, UpgradeStars: 100, SupplyTotal: 5, SlugPrefix: "channel-life-" + suffix,
+		Models: []domain.StarGiftCollectibleAttribute{
+			{Kind: domain.StarGiftCollectibleModel, Name: "Channel Model", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestDocumentPtr(baseDocumentID+1, "channel-model.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+1, "channel-model"), Animation: collectibleTestAnimationPtr("channel-model.tgs")},
+			{Kind: domain.StarGiftCollectibleModel, Name: "Channel Crafted", RarityKind: domain.StarGiftRarityLegendary, Crafted: true,
+				Document: collectibleTestDocumentPtr(baseDocumentID+2, "channel-crafted.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+2, "channel-crafted"), Animation: collectibleTestAnimationPtr("channel-crafted.tgs")},
+			{Kind: domain.StarGiftCollectibleModel, Name: "Channel Model Two", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestDocumentPtr(baseDocumentID+4, "channel-model-two.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+4, "channel-model-two"), Animation: collectibleTestAnimationPtr("channel-model-two.tgs")},
+		},
+		Patterns: []domain.StarGiftCollectibleAttribute{
+			{Kind: domain.StarGiftCollectiblePattern, Name: "Channel Pattern", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestPatternDocumentPtr(baseDocumentID+3, "channel-pattern.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+3, "channel-pattern"), Animation: collectibleTestAnimationPtr("channel-pattern.tgs")},
+			{Kind: domain.StarGiftCollectiblePattern, Name: "Channel Pattern Two", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestPatternDocumentPtr(baseDocumentID+5, "channel-pattern-two.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+5, "channel-pattern-two"), Animation: collectibleTestAnimationPtr("channel-pattern-two.tgs")},
+		},
+		Backdrops: []domain.StarGiftCollectibleAttribute{
+			{Kind: domain.StarGiftCollectibleBackdrop, Name: "Channel Backdrop", BackdropID: 88, CenterColor: 0x112233, EdgeColor: 0x223344, PatternColor: 0x334455, TextColor: 0xffffff, RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000},
+			{Kind: domain.StarGiftCollectibleBackdrop, Name: "Channel Backdrop Two", BackdropID: 89, CenterColor: 0xaabbcc, EdgeColor: 0x778899, PatternColor: 0xddeeff, TextColor: 0x111111, RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000},
+		},
+		Actor: "integration", CommandID: "channel-gift-pool-" + suffix,
+	}); err != nil {
+		t.Fatalf("publish channel gift pool: %v", err)
+	}
+	messages := NewMessageStore(pool)
+	lifecycle := NewStarGiftLifecycleStore(pool, messages, 1_000_000, WithStarGiftMarketPolicy(domain.StarGiftMarketPolicy{
+		StarsProceedsPermille: 900, TONProceedsPermille: 900,
+	}))
+	if err := lifecycle.SetStarGiftNotifications(ctx, mutedAdmin.ID, created.Channel.ID, false); err != nil {
+		t.Fatalf("disable muted admin channel gift notifications: %v", err)
+	}
+	upgrades := NewStarGiftUpgradeStore(pool, messages, WithStarGiftLifecyclePolicy(domain.StarGiftLifecyclePolicy{
+		TransferStars: 25, DropOriginalDetailsStars: 25, OfferMinStars: 1, CraftChancePermille: 500,
+	}))
+	var channelPtsBeforePurchase int
+	if err := pool.QueryRow(ctx, `SELECT pts FROM channels WHERE id=$1`, created.Channel.ID).Scan(&channelPtsBeforePurchase); err != nil {
+		t.Fatalf("load channel pts before gift purchase: %v", err)
+	}
+	channelPurchaseReq := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: actor.ID, To: channelPeer,
+		GiftID: entry.Gift.ID, CommandKey: "channel-purchase-" + suffix, Date: now + 1})
+	purchased, err := lifecycle.PurchaseStarGift(ctx, channelPurchaseReq)
+	if err != nil || purchased.Saved.SavedID <= 0 || purchased.Balance.Balance != 9950 {
+		t.Fatalf("atomic channel purchase = %+v err %v", purchased, err)
+	}
+	var regularLogs int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM channel_admin_log_events
+WHERE channel_id=$1 AND event_type='send_message' AND message::text LIKE '%star_gift%'`, created.Channel.ID).Scan(&regularLogs); err != nil || regularLogs != 1 {
+		t.Fatalf("channel purchase admin logs = %d err %v", regularLogs, err)
+	}
+	var notificationRecipients []int64
+	rows, err := pool.Query(ctx, `SELECT target_user_id FROM star_gift_channel_notification_jobs
+WHERE saved_gift_id=$1 ORDER BY target_user_id`, purchased.Saved.ID)
+	if err != nil {
+		t.Fatalf("list channel gift notification recipients: %v", err)
+	}
+	for rows.Next() {
+		var userID int64
+		if err := rows.Scan(&userID); err != nil {
+			rows.Close()
+			t.Fatalf("scan channel gift notification recipient: %v", err)
+		}
+		notificationRecipients = append(notificationRecipients, userID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		t.Fatalf("iterate channel gift notification recipients: %v", err)
+	}
+	rows.Close()
+	wantRecipients := []int64{actor.ID, notifyAdmin.ID}
+	if fmt.Sprint(notificationRecipients) != fmt.Sprint(wantRecipients) {
+		t.Fatalf("channel gift notification recipients=%v want=%v (muted/no-post/member excluded)",
+			notificationRecipients, wantRecipients)
+	}
+	var notificationMessageID, notificationDeliveredAt, notificationAttempts int
+	if err := pool.QueryRow(ctx, `SELECT message_id,delivered_at,attempts
+FROM star_gift_channel_notification_jobs
+WHERE saved_gift_id=$1 AND target_user_id=$2`, purchased.Saved.ID, actor.ID).
+		Scan(&notificationMessageID, &notificationDeliveredAt, &notificationAttempts); err != nil ||
+		notificationMessageID <= 0 || notificationDeliveredAt <= 0 || notificationAttempts != 1 {
+		t.Fatalf("channel gift notification job message=%d delivered=%d attempts=%d err=%v",
+			notificationMessageID, notificationDeliveredAt, notificationAttempts, err)
+	}
+	notificationRef, found, err := gifts.ResolveUserMessageRef(ctx, actor.ID, notificationMessageID)
+	if err != nil || !found || notificationRef.Owner != channelPeer ||
+		notificationRef.SavedID != purchased.Saved.SavedID {
+		t.Fatalf("channel gift notification alias = %+v found=%v err=%v", notificationRef, found, err)
+	}
+	var notificationPts, notificationEvents, notificationOutbox, channelPtsAfterPurchase int
+	var notificationMediaJSON string
+	if err := pool.QueryRow(ctx, `SELECT pts,media::text FROM message_boxes
+WHERE owner_user_id=$1 AND box_id=$2`, actor.ID, notificationMessageID).
+		Scan(&notificationPts, &notificationMediaJSON); err != nil {
+		t.Fatalf("load channel gift notification message: %v", err)
+	}
+	notificationMedia, err := decodeMessageMedia(notificationMediaJSON)
+	if err != nil || notificationMedia == nil || notificationMedia.ServiceAction == nil ||
+		notificationMedia.ServiceAction.StarGift == nil ||
+		notificationMedia.ServiceAction.StarGift.PeerChannelID != created.Channel.ID ||
+		notificationMedia.ServiceAction.StarGift.SavedID != purchased.Saved.SavedID {
+		t.Fatalf("channel gift notification media = %+v err=%v", notificationMedia, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM user_update_events
+WHERE user_id=$1 AND pts=$2 AND event_type='new_message'`, actor.ID, notificationPts).Scan(&notificationEvents); err != nil ||
+		notificationEvents != 1 {
+		t.Fatalf("channel gift notification events=%d err=%v", notificationEvents, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM dispatch_outbox
+WHERE target_user_id=$1 AND pts=$2`, actor.ID, notificationPts).Scan(&notificationOutbox); err != nil ||
+		notificationOutbox != 1 {
+		t.Fatalf("channel gift notification outbox=%d err=%v", notificationOutbox, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT pts FROM channels WHERE id=$1`, created.Channel.ID).Scan(&channelPtsAfterPurchase); err != nil ||
+		channelPtsAfterPurchase != channelPtsBeforePurchase {
+		t.Fatalf("channel gift notification changed channel pts: before=%d after=%d err=%v",
+			channelPtsBeforePurchase, channelPtsAfterPurchase, err)
+	}
+	// Simulate a process stopping after the private message committed but before
+	// the job completion update. The next claim must replay the same message and
+	// must not allocate a second account PTS/event/outbox row.
+	if _, err := pool.Exec(ctx, `UPDATE star_gift_channel_notification_jobs
+SET delivered_at=0,message_id=0,next_attempt_at=$3,lease_until=0
+WHERE saved_gift_id=$1 AND target_user_id=$2`, purchased.Saved.ID, actor.ID, now+1); err != nil {
+		t.Fatalf("reset notification job for replay probe: %v", err)
+	}
+	if delivered, err := lifecycle.dispatchChannelStarGiftNotifications(ctx, now+2, 1, purchased.Saved.ID); err != nil || delivered != 1 {
+		t.Fatalf("replay channel gift notification delivered=%d err=%v", delivered, err)
+	}
+	var replayMessageID, replayEventCount int
+	if err := pool.QueryRow(ctx, `SELECT message_id FROM star_gift_channel_notification_jobs
+WHERE saved_gift_id=$1 AND target_user_id=$2`, purchased.Saved.ID, actor.ID).Scan(&replayMessageID); err != nil ||
+		replayMessageID != notificationMessageID {
+		t.Fatalf("channel gift notification replay message=%d want=%d err=%v", replayMessageID, notificationMessageID, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM user_update_events
+WHERE user_id=$1 AND pts=$2 AND event_type='new_message'`, actor.ID, notificationPts).Scan(&replayEventCount); err != nil ||
+		replayEventCount != 1 {
+		t.Fatalf("channel gift notification replay events=%d err=%v", replayEventCount, err)
+	}
+	if enabled, err := lifecycle.StarGiftNotificationsEnabled(ctx, actor.ID, created.Channel.ID); err != nil || !enabled {
+		t.Fatalf("default channel gift notification setting enabled=%v err=%v", enabled, err)
+	}
+	if err := lifecycle.SetStarGiftNotifications(ctx, actor.ID, created.Channel.ID, false); err != nil {
+		t.Fatalf("disable channel gift notifications: %v", err)
+	}
+	if enabled, err := lifecycle.StarGiftNotificationsEnabled(ctx, actor.ID, created.Channel.ID); err != nil || enabled {
+		t.Fatalf("disabled channel gift notification setting enabled=%v err=%v", enabled, err)
+	}
+	if err := lifecycle.SetStarGiftNotifications(ctx, actor.ID, created.Channel.ID, true); err != nil {
+		t.Fatalf("re-enable channel gift notifications: %v", err)
+	}
+	var channelPrice string
+	var channelPrepaidAmount any
+	if err := pool.QueryRow(ctx, `SELECT message #>> '{Action,StarGift,upgrade_price_stars}', message #> '{Action,StarGift,upgrade_stars}'
+FROM channel_admin_log_events WHERE channel_id=$1 AND event_type='send_message' ORDER BY id DESC LIMIT 1`, created.Channel.ID).
+		Scan(&channelPrice, &channelPrepaidAmount); err != nil || channelPrice != "100" || channelPrepaidAmount != nil {
+		t.Fatalf("channel ordinary action price=%q prepaid=%v err=%v", channelPrice, channelPrepaidAmount, err)
+	}
+	if replay, err := lifecycle.PurchaseStarGift(ctx, channelPurchaseReq); err != nil || !replay.Duplicate {
+		t.Fatalf("channel purchase replay = %+v err %v", replay, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM channel_admin_log_events
+WHERE channel_id=$1 AND event_type='send_message' AND message::text LIKE '%star_gift%'`, created.Channel.ID).Scan(&regularLogs); err != nil || regularLogs != 1 {
+		t.Fatalf("channel replay duplicated admin log count=%d err %v", regularLogs, err)
+	}
+
+	converted, err := lifecycle.ConvertStarGift(ctx, domain.StarGiftConvertRequest{ActorUserID: actor.ID,
+		Ref: domain.SavedStarGiftRef{Owner: channelPeer, SavedID: purchased.Saved.SavedID}, Date: now + 2})
+	if err != nil || !converted.Saved.Converted || converted.OwnerBalance != 20 {
+		t.Fatalf("atomic channel conversion = %+v err %v", converted, err)
+	}
+	var channelBalance, conversionRows, conversionTxns int64
+	if err := pool.QueryRow(ctx, `SELECT balance FROM channel_stars_balances WHERE channel_id=$1`, created.Channel.ID).Scan(&channelBalance); err != nil || channelBalance != 20 {
+		t.Fatalf("channel conversion balance = %d err %v", channelBalance, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM star_gift_conversions WHERE saved_gift_id=$1`, purchased.Saved.ID).Scan(&conversionRows); err != nil || conversionRows != 1 {
+		t.Fatalf("channel conversion command rows = %d err %v", conversionRows, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM channel_stars_transactions WHERE channel_id=$1 AND gift_id=$2`, created.Channel.ID, entry.Gift.ID).Scan(&conversionTxns); err != nil || conversionTxns != 1 {
+		t.Fatalf("channel conversion transactions = %d err %v", conversionTxns, err)
+	}
+	if balance, err := lifecycle.ChannelStarsBalance(ctx, created.Channel.ID); err != nil || balance != 20 {
+		t.Fatalf("channel stars balance projection = %d err %v", balance, err)
+	}
+	starsPage, err := lifecycle.ChannelStarsTransactions(ctx, created.Channel.ID, domain.StarsTransactionQuery{Limit: 20})
+	if err != nil || starsPage.Balance != 20 || len(starsPage.Transactions) != 1 ||
+		starsPage.Transactions[0].Amount != 20 || starsPage.Transactions[0].Reason != domain.StarsReasonGift {
+		t.Fatalf("channel stars transaction projection = %+v err %v", starsPage, err)
+	}
+	if _, err := lifecycle.ConvertStarGift(ctx, domain.StarGiftConvertRequest{ActorUserID: actor.ID,
+		Ref: domain.SavedStarGiftRef{Owner: channelPeer, SavedID: purchased.Saved.SavedID}, Date: now + 3}); !errors.Is(err, domain.ErrStarGiftAlreadyConverted) {
+		t.Fatalf("repeated channel conversion err = %v, want already converted", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT balance FROM channel_stars_balances WHERE channel_id=$1`, created.Channel.ID).Scan(&channelBalance); err != nil || channelBalance != 20 {
+		t.Fatalf("channel balance after replay = %d err %v", channelBalance, err)
+	}
+
+	// A third party may prepay the upgrade entitlement of a channel-owned gift.
+	// The payer's personal Stars and the channel saved-gift entitlement commit
+	// together; the payment is also visible in channel Recent Actions.
+	channelPrepayTargetReq := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: actor.ID, To: channelPeer,
+		GiftID: entry.Gift.ID, CommandKey: "channel-prepay-target-" + suffix, Date: now + 4})
+	channelPrepayTarget, err := lifecycle.PurchaseStarGift(ctx, channelPrepayTargetReq)
+	if err != nil || channelPrepayTarget.Saved.PrepaidUpgradeHash == "" {
+		t.Fatalf("channel prepay target purchase = %+v err %v", channelPrepayTarget, err)
+	}
+	prepayTarget, prepayPrice, err := lifecycle.PrepaidUpgradeTarget(ctx, channelPeer, channelPrepayTarget.Saved.PrepaidUpgradeHash)
+	if err != nil || prepayTarget.ID != channelPrepayTarget.Saved.ID || prepayPrice != 100 {
+		t.Fatalf("channel prepay target = %+v price=%d err=%v", prepayTarget, prepayPrice, err)
+	}
+	channelPrepayReq := domain.StarGiftPrepaidUpgradeRequest{
+		PayerUserID: actor.ID, Owner: channelPeer, Hash: channelPrepayTarget.Saved.PrepaidUpgradeHash,
+		ChargeStars: 100, FormID: 21006, CommandKey: "channel-prepay-" + suffix, Date: now + 4,
+	}
+	channelPrepay, err := lifecycle.PrepayStarGiftUpgrade(ctx, channelPrepayReq)
+	if err != nil || channelPrepay.Saved.PrepaidUpgradeStars != 100 || channelPrepay.Saved.PrepaidUpgradeHash != "" ||
+		channelPrepay.Send.RecipientMessage.OwnerUserID != actor.ID {
+		t.Fatalf("channel prepaid entitlement = %+v err %v", channelPrepay, err)
+	}
+	prepayAlias, found, err := gifts.ResolveUserMessageRef(ctx, actor.ID, channelPrepay.Send.RecipientMessage.ID)
+	if err != nil || !found || prepayAlias.Owner != channelPeer ||
+		prepayAlias.SavedID != channelPrepay.Saved.SavedID {
+		t.Fatalf("channel prepaid notification alias = %+v found=%v err=%v", prepayAlias, found, err)
+	}
+	var prepayLogs int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM channel_admin_log_events
+WHERE channel_id=$1 AND message::text LIKE '%prepaid_upgrade%'`, created.Channel.ID).Scan(&prepayLogs); err != nil || prepayLogs != 2 {
+		t.Fatalf("channel prepaid upgrade admin logs = %d err %v", prepayLogs, err)
+	}
+	channelPrepayReplay, err := lifecycle.PrepayStarGiftUpgrade(ctx, channelPrepayReq)
+	if err != nil || !channelPrepayReplay.Duplicate || channelPrepayReplay.Saved.ID != channelPrepay.Saved.ID {
+		t.Fatalf("channel prepaid entitlement replay = %+v err %v", channelPrepayReplay, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM channel_admin_log_events
+WHERE channel_id=$1 AND message::text LIKE '%prepaid_upgrade%'`, created.Channel.ID).Scan(&prepayLogs); err != nil || prepayLogs != 2 {
+		t.Fatalf("channel prepaid upgrade replay logs = %d err %v", prepayLogs, err)
+	}
+
+	var ptsBeforeUpgrade int
+	if err := pool.QueryRow(ctx, `SELECT pts FROM channels WHERE id=$1`, created.Channel.ID).Scan(&ptsBeforeUpgrade); err != nil {
+		t.Fatal(err)
+	}
+	prepaidPurchaseReq := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: actor.ID, To: channelPeer,
+		GiftID: entry.Gift.ID, IncludeUpgrade: true, CommandKey: "channel-prepaid-purchase-" + suffix, Date: now + 4})
+	prepaidPurchase, err := lifecycle.PurchaseStarGift(ctx, prepaidPurchaseReq)
+	if err != nil || prepaidPurchase.Saved.PrepaidUpgradeStars != 100 || prepaidPurchase.Saved.SavedID <= 0 {
+		t.Fatalf("channel prepaid gift purchase = %+v err %v", prepaidPurchase, err)
+	}
+	upgradeReq := domain.StarGiftUpgradeRequest{UserID: actor.ID,
+		Ref: domain.SavedStarGiftRef{Owner: channelPeer, SavedID: prepaidPurchase.Saved.SavedID}, RequirePrepaid: true,
+		KeepOriginalDetails: true, CommandKey: "channel-upgrade-" + suffix, Date: now + 5,
+	}
+	upgraded, err := upgrades.UpgradeStarGift(ctx, upgradeReq)
+	if err != nil || upgraded.Saved.Owner != channelPeer || upgraded.Unique.Owner != channelPeer ||
+		upgraded.Saved.SavedID != prepaidPurchase.Saved.SavedID || upgraded.Send.RecipientMessage.OwnerUserID != actor.ID {
+		t.Fatalf("channel prepaid upgrade = %+v err %v", upgraded, err)
+	}
+	action := upgraded.Send.RecipientMessage.Media.ServiceAction.StarGiftUnique
+	if action == nil || action.FromUserID != actor.ID || action.Peer != channelPeer ||
+		action.SavedID != prepaidPurchase.Saved.SavedID || !action.Upgrade || !action.PrepaidUpgrade || action.TransferStars != 25 ||
+		action.CanCraftAt != 0 || action.Gift.CraftChancePermille != 500 ||
+		upgraded.Saved.CanCraftAt != now+5 || upgraded.Unique.CraftChancePermille != 500 {
+		t.Fatalf("channel upgrade service action = %+v", action)
+	}
+	upgradeAlias, found, err := gifts.ResolveUserMessageRef(ctx, actor.ID, upgraded.Send.RecipientMessage.ID)
+	if err != nil || !found || upgradeAlias.Owner != channelPeer ||
+		upgradeAlias.SavedID != upgraded.Saved.SavedID {
+		t.Fatalf("channel upgrade notification alias = %+v found=%v err=%v", upgradeAlias, found, err)
+	}
+	var ptsAfterUpgrade int
+	if err := pool.QueryRow(ctx, `SELECT pts FROM channels WHERE id=$1`, created.Channel.ID).Scan(&ptsAfterUpgrade); err != nil || ptsAfterUpgrade != ptsBeforeUpgrade {
+		t.Fatalf("channel pts after profile gift upgrade = %d want %d err %v", ptsAfterUpgrade, ptsBeforeUpgrade, err)
+	}
+	var upgradeLogs int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM channel_admin_log_events
+WHERE channel_id=$1 AND message::text LIKE '%star_gift_unique%'`, created.Channel.ID).Scan(&upgradeLogs); err != nil || upgradeLogs != 1 {
+		t.Fatalf("channel upgrade admin logs = %d err %v", upgradeLogs, err)
+	}
+	replayedUpgrade, err := upgrades.UpgradeStarGift(ctx, upgradeReq)
+	if err != nil || !replayedUpgrade.Duplicate || replayedUpgrade.Unique.ID != upgraded.Unique.ID {
+		t.Fatalf("channel upgrade replay = %+v err %v", replayedUpgrade, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM channel_admin_log_events
+WHERE channel_id=$1 AND message::text LIKE '%star_gift_unique%'`, created.Channel.ID).Scan(&upgradeLogs); err != nil || upgradeLogs != 1 {
+		t.Fatalf("channel upgrade replay admin logs = %d err %v", upgradeLogs, err)
+	}
+	dropped, err := lifecycle.DropStarGiftOriginalDetails(ctx, domain.StarGiftDropOriginalDetailsRequest{
+		UserID: actor.ID, Ref: domain.SavedStarGiftRef{Owner: channelPeer, SavedID: upgraded.Saved.SavedID},
+		ChargeStars: 25, FormID: 21007, CommandKey: "channel-drop-details-" + suffix, Date: now + 6,
+	})
+	if err != nil || dropped.Saved.Owner != channelPeer || dropped.Unique.KeepOriginalDetails || dropped.Saved.DropOriginalDetailsStars != 0 {
+		t.Fatalf("channel drop original details = %+v err %v", dropped, err)
+	}
+
+	listed, err := lifecycle.SetStarGiftListing(ctx, domain.StarGiftListingRequest{ActorUserID: actor.ID,
+		Ref:    domain.SavedStarGiftRef{Owner: channelPeer, SavedID: upgraded.Saved.SavedID},
+		Amount: &domain.StarGiftAmount{Currency: domain.StarGiftCurrencyTON, Amount: 1000}, Date: now + 6,
+	})
+	if err != nil || listed.ResellAmount == nil || listed.Owner != channelPeer {
+		t.Fatalf("list channel collectible = %+v err %v", listed, err)
+	}
+	if balance, err := lifecycle.TonBalance(ctx, actor.ID); err != nil || balance != 1_000_000 {
+		t.Fatalf("channel resale buyer local TON grant = %d err %v", balance, err)
+	}
+	resaleReq := domain.StarGiftResalePurchaseRequest{BuyerUserID: actor.ID, Slug: listed.Slug, To: targetChannelPeer,
+		Amount: domain.StarGiftAmount{Currency: domain.StarGiftCurrencyTON, Amount: 1000}, FormID: 21004,
+		CommandKey: "channel-to-channel-resale-" + suffix, Date: now + 7,
+	}
+	resold, err := lifecycle.PurchaseResaleStarGift(ctx, resaleReq)
+	if err != nil || resold.Unique.Owner != targetChannelPeer || resold.Saved.Owner != targetChannelPeer ||
+		resold.Saved.SavedID != upgraded.Saved.ID || resold.Balance.Balance != 999000 ||
+		resold.Saved.CanCraftAt != upgraded.Saved.CanCraftAt ||
+		resold.Unique.CraftChancePermille != upgraded.Unique.CraftChancePermille {
+		t.Fatalf("channel-to-channel local TON resale = %+v err %v", resold, err)
+	}
+	var channelTON, channelTONTxns, targetResaleLogs, commission int64
+	if err := pool.QueryRow(ctx, `SELECT balance_nanoton FROM channel_ton_balances WHERE channel_id=$1`, created.Channel.ID).Scan(&channelTON); err != nil || channelTON != 900 {
+		t.Fatalf("channel local TON proceeds = %d err %v", channelTON, err)
+	}
+	if balance, err := lifecycle.ChannelTonBalance(ctx, created.Channel.ID); err != nil || balance != 900 {
+		t.Fatalf("channel ton balance projection = %d err %v", balance, err)
+	}
+	tonPage, err := lifecycle.ChannelTonTransactions(ctx, created.Channel.ID, domain.StarsTransactionQuery{Limit: 20})
+	if err != nil || tonPage.Balance != 900 || len(tonPage.Transactions) != 1 ||
+		tonPage.Transactions[0].Amount != 900 || tonPage.Transactions[0].Reason != domain.StarsReasonGiftResale {
+		t.Fatalf("channel ton transaction projection = %+v err %v", tonPage, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM channel_ton_transactions WHERE channel_id=$1 AND gift_id=$2`, created.Channel.ID, listed.ID).Scan(&channelTONTxns); err != nil || channelTONTxns != 1 {
+		t.Fatalf("channel local TON transactions = %d err %v", channelTONTxns, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM channel_admin_log_events WHERE channel_id=$1 AND message::text LIKE '%star_gift_unique%'`,
+		createdTarget.Channel.ID).Scan(&targetResaleLogs); err != nil || targetResaleLogs != 1 {
+		t.Fatalf("target channel resale admin logs = %d err %v", targetResaleLogs, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT commission_amount FROM star_gift_sales WHERE command_key=$1`, resaleReq.CommandKey).Scan(&commission); err != nil || commission != 100 {
+		t.Fatalf("channel TON resale commission = %d err %v", commission, err)
+	}
+	resaleReplay, err := lifecycle.PurchaseResaleStarGift(ctx, resaleReq)
+	if err != nil || !resaleReplay.Duplicate || resaleReplay.Unique.ID != resold.Unique.ID {
+		t.Fatalf("channel resale replay = %+v err %v", resaleReplay, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT balance_nanoton FROM channel_ton_balances WHERE channel_id=$1`, created.Channel.ID).Scan(&channelTON); err != nil || channelTON != 900 {
+		t.Fatalf("channel TON proceeds after replay = %d err %v", channelTON, err)
+	}
+	toUser, err := lifecycle.TransferStarGift(ctx, domain.StarGiftTransferRequest{
+		ActorUserID: actor.ID,
+		Ref: domain.SavedStarGiftRef{
+			Owner: targetChannelPeer, SavedID: resold.Saved.SavedID,
+		},
+		To: domain.Peer{Type: domain.PeerTypeUser, ID: actor.ID}, ChargeStars: resold.Saved.TransferStars,
+		CommandKey: "channel-craft-entitlement-to-user-" + suffix, Date: now + 8,
+	})
+	if err != nil || toUser.Saved.Owner.Type != domain.PeerTypeUser || toUser.Saved.Owner.ID != actor.ID ||
+		toUser.Saved.CanCraftAt != upgraded.Saved.CanCraftAt ||
+		toUser.Unique.CraftChancePermille != upgraded.Unique.CraftChancePermille {
+		t.Fatalf("channel-to-user Craft entitlement transfer = %+v err %v", toUser, err)
+	}
+	toUserAction := toUser.Send.SenderMessage.Media.ServiceAction.StarGiftUnique
+	if toUserAction == nil || toUserAction.CanCraftAt != upgraded.Saved.CanCraftAt {
+		t.Fatalf("channel-to-user action did not restore Craft readiness: %+v", toUserAction)
+	}
+	backToChannel, err := lifecycle.TransferStarGift(ctx, domain.StarGiftTransferRequest{
+		ActorUserID: actor.ID,
+		Ref: domain.SavedStarGiftRef{
+			Owner: toUser.Saved.Owner, MsgID: toUser.Saved.MsgID,
+		},
+		To: channelPeer, ChargeStars: toUser.Saved.TransferStars,
+		CommandKey: "user-craft-entitlement-to-channel-" + suffix, Date: now + 9,
+	})
+	if err != nil || backToChannel.Saved.Owner != channelPeer ||
+		backToChannel.Saved.CanCraftAt != upgraded.Saved.CanCraftAt ||
+		backToChannel.Unique.CraftChancePermille != upgraded.Unique.CraftChancePermille {
+		t.Fatalf("user-to-channel Craft entitlement transfer = %+v err %v", backToChannel, err)
+	}
+
+	var remainsBefore int
+	if err := pool.QueryRow(ctx, `SELECT availability_remains FROM star_gift_catalog WHERE gift_id=$1`, entry.Gift.ID).Scan(&remainsBefore); err != nil {
+		t.Fatal(err)
+	}
+	balanceBefore, _ := NewStarsStore(pool).GetBalance(ctx, actor.ID)
+	invalidChannelReq := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{BuyerUserID: actor.ID,
+		To: domain.Peer{Type: domain.PeerTypeChannel, ID: created.Channel.ID + 999999}, GiftID: entry.Gift.ID,
+		CommandKey: "invalid-channel-purchase-" + suffix, Date: now + 2})
+	_, err = lifecycle.PurchaseStarGift(ctx, invalidChannelReq)
+	if err == nil {
+		t.Fatal("purchase to missing channel unexpectedly succeeded")
+	}
+	var remainsAfter int
+	if err := pool.QueryRow(ctx, `SELECT availability_remains FROM star_gift_catalog WHERE gift_id=$1`, entry.Gift.ID).Scan(&remainsAfter); err != nil || remainsAfter != remainsBefore {
+		t.Fatalf("inventory after rolled-back channel purchase = %d want %d err %v", remainsAfter, remainsBefore, err)
+	}
+	if balanceAfter, err := NewStarsStore(pool).GetBalance(ctx, actor.ID); err != nil || balanceAfter.Balance != balanceBefore.Balance {
+		t.Fatalf("balance after rolled-back channel purchase = %+v want %+v err %v", balanceAfter, balanceBefore, err)
+	}
+
+	auctionEntry, err := gifts.CreateCatalogRevision(ctx, domain.StarGiftCatalogWrite{
+		Title: "Channel Auction " + suffix, Stars: 100, Enabled: true, Limited: true, Auction: true,
+		AvailabilityTotal: 1, AvailabilityRemains: 1, GiftsPerRound: 1, AuctionStartDate: now - 10,
+		AuctionSlug: "channel-auction-" + suffix,
+		Document:    collectibleTestDocument(baseDocumentID+100, "channel-auction.tgs"), Blob: collectibleTestBlob(baseDocumentID+100, "channel-auction"),
+		Animation: collectibleTestAnimation("channel-auction.tgs"), Actor: "integration", CommandID: "channel-auction-" + suffix,
+	})
+	if err != nil {
+		t.Fatalf("create channel auction: %v", err)
+	}
+	if _, _, err := lifecycle.BidStarGiftAuction(ctx, domain.StarGiftAuctionBidRequest{UserID: actor.ID,
+		GiftID: auctionEntry.Gift.ID, Peer: channelPeer, BidAmount: 250, FormID: 22001, Date: now + 3,
+	}); err != nil {
+		t.Fatalf("bid channel auction: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE star_gift_auctions SET next_round_at=$2 WHERE gift_id=$1`, auctionEntry.Gift.ID, now+4); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.SweepStarGiftLifecycle(ctx, now+4, 1000); err != nil {
+		t.Fatalf("settle channel auction: %v", err)
+	}
+	var awardSavedID int64
+	if err := pool.QueryRow(ctx, `SELECT saved_gift_id FROM star_gift_auction_acquired WHERE gift_id=$1`, auctionEntry.Gift.ID).Scan(&awardSavedID); err != nil || awardSavedID <= 0 {
+		t.Fatalf("channel auction saved id = %d err %v", awardSavedID, err)
+	}
+	var auctionSoldOut bool
+	if err := pool.QueryRow(ctx, `SELECT r.sold_out FROM star_gift_catalog c
+JOIN star_gift_catalog_revisions r ON r.id=c.active_revision_id WHERE c.gift_id=$1`, auctionEntry.Gift.ID).Scan(&auctionSoldOut); err != nil || !auctionSoldOut {
+		t.Fatalf("exhausted auction gift sold_out=%v want true err=%v", auctionSoldOut, err)
+	}
+	var awardLogs int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM channel_admin_log_events
+WHERE channel_id=$1 AND message::text LIKE '%auction_acquired%'`, created.Channel.ID).Scan(&awardLogs); err != nil || awardLogs != 1 {
+		t.Fatalf("channel auction admin logs = %d err %v", awardLogs, err)
+	}
+	// Channel awards are priced at the winning bid (250) as well; the catalog
+	// starting price is 100.
+	var channelPaidStars int64
+	if err := pool.QueryRow(ctx, `SELECT paid_stars FROM peer_star_gifts WHERE id=$1`, awardSavedID).
+		Scan(&channelPaidStars); err != nil || channelPaidStars != 250 {
+		t.Fatalf("channel auction paid_stars = %d want 250 err %v", channelPaidStars, err)
+	}
+	// jsonb re-serializes with a space after the colon, so match on the shape
+	// rather than on a literal substring.
+	var channelAwardStarsLogs int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM channel_admin_log_events
+WHERE channel_id=$1 AND message::text LIKE '%auction_acquired%' AND message::text ~ '"stars":[[:space:]]*250'`,
+		created.Channel.ID).Scan(&channelAwardStarsLogs); err != nil || channelAwardStarsLogs != 1 {
+		var raw string
+		_ = pool.QueryRow(ctx, `SELECT message::text FROM channel_admin_log_events
+WHERE channel_id=$1 AND message::text LIKE '%auction_acquired%' ORDER BY id DESC LIMIT 1`,
+			created.Channel.ID).Scan(&raw)
+		t.Fatalf("channel auction award log stars = %d want 1 err %v log=%s", channelAwardStarsLogs, err, raw)
+	}
+}
+
+func TestStarGiftCraftFailureConsumesThreeInputsPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	suffix := randomSuffix(t)
+	now := int(time.Now().Unix())
+	users := NewUserStore(pool)
+	buyer := createTestUser(t, ctx, users, "+1883"+suffix+"01", "CraftBuyer", "")
+	owner := createTestUser(t, ctx, users, "+1883"+suffix+"02", "CraftOwner", "")
+	ownerPeer := domain.Peer{Type: domain.PeerTypeUser, ID: owner.ID}
+	stars := NewStarsStore(pool)
+	for _, userID := range []int64{buyer.ID, owner.ID} {
+		if _, _, err := stars.EnsureGrant(ctx, userID, 10000, now); err != nil {
+			t.Fatalf("grant craft stars to %d: %v", userID, err)
+		}
+	}
+
+	gifts := NewStarGiftStore(pool)
+	baseDocumentID := time.Now().UnixNano() & 0x7ffffffffffff000
+	entry, err := gifts.CreateCatalogRevision(ctx, domain.StarGiftCatalogWrite{
+		Title: "Three Input Craft " + suffix, Stars: 50, ConvertStars: 20, Enabled: true,
+		Document: collectibleTestDocument(baseDocumentID, "three-input.tgs"),
+		Blob:     collectibleTestBlob(baseDocumentID, "three-input"), Animation: collectibleTestAnimation("three-input.tgs"),
+		Actor: "integration", CommandID: "three-input-catalog-" + suffix,
+	})
+	if err != nil {
+		t.Fatalf("create three-input catalog: %v", err)
+	}
+	if _, err := gifts.PublishCollectibleRevision(ctx, domain.StarGiftCollectibleWrite{
+		GiftID: entry.Gift.ID, UpgradeStars: 100, SupplyTotal: 10, SlugPrefix: "three-" + suffix,
+		Models: []domain.StarGiftCollectibleAttribute{
+			{Kind: domain.StarGiftCollectibleModel, Name: "Base", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestDocumentPtr(baseDocumentID+1, "base.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+1, "base"), Animation: collectibleTestAnimationPtr("base.tgs")},
+			{Kind: domain.StarGiftCollectibleModel, Name: "Crafted", RarityKind: domain.StarGiftRarityLegendary, Crafted: true,
+				Document: collectibleTestDocumentPtr(baseDocumentID+2, "crafted.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+2, "crafted"), Animation: collectibleTestAnimationPtr("crafted.tgs")},
+			{Kind: domain.StarGiftCollectibleModel, Name: "Base Two", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestDocumentPtr(baseDocumentID+4, "base-two.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+4, "base-two"), Animation: collectibleTestAnimationPtr("base-two.tgs")},
+		},
+		Patterns: []domain.StarGiftCollectibleAttribute{
+			{Kind: domain.StarGiftCollectiblePattern, Name: "Pattern", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestPatternDocumentPtr(baseDocumentID+3, "pattern.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+3, "pattern"), Animation: collectibleTestAnimationPtr("pattern.tgs")},
+			{Kind: domain.StarGiftCollectiblePattern, Name: "Pattern Two", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestPatternDocumentPtr(baseDocumentID+5, "pattern-two.tgs"), Blob: collectibleTestBlobPtr(baseDocumentID+5, "pattern-two"), Animation: collectibleTestAnimationPtr("pattern-two.tgs")},
+		},
+		Backdrops: []domain.StarGiftCollectibleAttribute{
+			{Kind: domain.StarGiftCollectibleBackdrop, Name: "Backdrop", BackdropID: 88, CenterColor: 0x112233, EdgeColor: 0x223344, PatternColor: 0x334455, TextColor: 0xffffff, RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000},
+			{Kind: domain.StarGiftCollectibleBackdrop, Name: "Backdrop Two", BackdropID: 89, CenterColor: 0xaabbcc, EdgeColor: 0x778899, PatternColor: 0xddeeff, TextColor: 0x111111, RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000},
+		},
+		Actor: "integration", CommandID: "three-input-pool-" + suffix,
+	}); err != nil {
+		t.Fatalf("publish three-input collectible: %v", err)
+	}
+
+	messages := NewMessageStore(pool)
+	lifecycle := NewStarGiftLifecycleStore(pool, messages, 1_000_000,
+		WithStarGiftCraftDraw(func(upper int) (int, error) { return upper - 1, nil }))
+	upgrades := NewStarGiftUpgradeStore(pool, messages, WithStarGiftLifecyclePolicy(domain.StarGiftLifecyclePolicy{
+		TransferStars: 25, DropOriginalDetailsStars: 25, OfferMinStars: 1, CraftChancePermille: 250,
+	}))
+	refs := make([]domain.SavedStarGiftRef, 0, 3)
+	uniqueIDs := make([]int64, 0, 3)
+	for i := 0; i < 3; i++ {
+		purchaseReq := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{
+			BuyerUserID: buyer.ID, To: ownerPeer, GiftID: entry.Gift.ID, IncludeUpgrade: true,
+			CommandKey: fmt.Sprintf("three-input-purchase-%s-%d", suffix, i), Date: now + i,
+		})
+		purchased, err := lifecycle.PurchaseStarGift(ctx, purchaseReq)
+		if err != nil {
+			t.Fatalf("purchase three-input gift %d: %v", i, err)
+		}
+		upgraded, err := upgrades.UpgradeStarGift(ctx, domain.StarGiftUpgradeRequest{UserID: owner.ID,
+			Ref: domain.SavedStarGiftRef{Owner: ownerPeer, MsgID: purchased.Saved.MsgID}, RequirePrepaid: true,
+			CommandKey: fmt.Sprintf("three-input-upgrade-%s-%d", suffix, i), Date: now + 10 + i,
+		})
+		if err != nil {
+			t.Fatalf("upgrade three-input gift %d: %v", i, err)
+		}
+		refs = append(refs, domain.SavedStarGiftRef{Owner: ownerPeer, MsgID: upgraded.Saved.UpgradeMsgID})
+		uniqueIDs = append(uniqueIDs, upgraded.Unique.ID)
+	}
+	req := domain.StarGiftCraftRequest{UserID: owner.ID, Refs: refs,
+		CommandKey: "three-input-craft-fail-" + suffix, Date: now + 20}
+	failed, err := lifecycle.CraftStarGift(ctx, req)
+	if err != nil || failed.Success || failed.Chance != 750 || failed.Gift != nil {
+		t.Fatalf("three-input craft failure = %+v err=%v", failed, err)
+	}
+	for _, uniqueID := range uniqueIDs {
+		edit := craftedSourceEditForUserAndGift(failed, owner.ID, uniqueID)
+		action := starGiftUniqueActionFromEdit(edit)
+		if edit.Event.Pts <= 0 || action == nil || !action.Gift.Burned || action.Gift.CraftChancePermille != 0 ||
+			action.Saved || action.CanCraftAt != 0 {
+			t.Fatalf("three-input terminal edit for %d = %+v", uniqueID, edit)
+		}
+		var burned bool
+		var status string
+		if err := pool.QueryRow(ctx, `SELECT u.burned,p.lifecycle_status
+FROM unique_star_gifts u JOIN peer_star_gifts p ON p.unique_gift_id=u.id WHERE u.id=$1`, uniqueID).
+			Scan(&burned, &status); err != nil || !burned || status != "burned" {
+			t.Fatalf("three-input terminal aggregate %d burned=%v status=%q err=%v", uniqueID, burned, status, err)
+		}
+	}
+	var sourcePTS []int32
+	var outputMedia, outputFingerprint []byte
+	if err := pool.QueryRow(ctx, `SELECT source_edit_pts,output_media,output_fingerprint
+FROM star_gift_craft_commands WHERE user_id=$1 AND command_key=$2`, owner.ID, req.CommandKey).
+		Scan(&sourcePTS, &outputMedia, &outputFingerprint); err != nil || len(sourcePTS) != 3 ||
+		len(outputMedia) != 0 || len(outputFingerprint) != 0 {
+		t.Fatalf("three-input failure receipt pts=%v media=%d fingerprint=%d err=%v", sourcePTS, len(outputMedia), len(outputFingerprint), err)
+	}
+	replay, err := lifecycle.CraftStarGift(ctx, req)
+	if err != nil || !replay.Duplicate || replay.Success || replay.Chance != 750 {
+		t.Fatalf("three-input failure replay = %+v err=%v", replay, err)
+	}
+	for i, uniqueID := range uniqueIDs {
+		if edit := craftedSourceEditForUserAndGift(replay, owner.ID, uniqueID); edit.Event.Pts != int(sourcePTS[i]) {
+			t.Fatalf("three-input replay pts for %d = %d want %d", uniqueID, edit.Event.Pts, sourcePTS[i])
+		}
+	}
+}
+
+func issueLifecyclePurchaseForm(t *testing.T, ctx context.Context, lifecycle *StarGiftLifecycleStore,
+	req domain.StarGiftPurchaseRequest) domain.StarGiftPurchaseRequest {
+	t.Helper()
+	var revisionID int64
+	if err := lifecycle.db.QueryRow(ctx, `SELECT active_revision_id FROM star_gift_catalog WHERE gift_id=$1`, req.GiftID).Scan(&revisionID); err != nil {
+		t.Fatalf("load active gift revision: %v", err)
+	}
+	gift, found, err := NewStarGiftStore(lifecycle.db).CatalogRevision(ctx, revisionID)
+	if err != nil || !found {
+		t.Fatalf("load gift revision %d: found=%v err=%v", revisionID, found, err)
+	}
+	req.RevisionID = gift.RevisionID
+	req.ChargeStars = gift.Stars
+	if req.IncludeUpgrade {
+		req.ChargeStars += gift.UpgradeStars
+	}
+	issued, err := lifecycle.IssueStarGiftPurchaseForm(ctx, domain.StarGiftPurchaseForm{
+		BuyerUserID: req.BuyerUserID, To: req.To, GiftID: req.GiftID, RevisionID: req.RevisionID,
+		IncludeUpgrade: req.IncludeUpgrade, HideName: req.HideName, Message: req.Message, ChargeStars: req.ChargeStars,
+		IssuedAt: req.Date, ExpiresAt: req.Date + 600,
+	})
+	if err != nil {
+		t.Fatalf("issue purchase form: %v", err)
+	}
+	req.FormID = issued.FormID
+	return req
+}
+
+func upgradedSourceEditForMessage(result domain.StarGiftUpgradeResult, userID int64, messageID int) domain.EditedMessageForUser {
+	for _, edit := range result.SourceEdits {
+		if edit.UserID == userID && edit.Message.ID == messageID {
+			return edit
+		}
+	}
+	return domain.EditedMessageForUser{UserID: userID}
+}
+
+func verifyPrepaidMessageRefMigration(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	savedGiftID int64,
+	ownerUserID int64,
+	payerUserID int64,
+	ownerPrepayMessageID int,
+	payerPrepayMessageID int,
+	ownerUpgradeMessageID int,
+) {
+	t.Helper()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin prepaid message migration probe: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	var messageSenderID, privateMessageID int64
+	if err := tx.QueryRow(ctx, `SELECT message_sender_id,private_message_id FROM message_boxes
+WHERE owner_user_id=$1 AND box_id=$2 AND NOT deleted`, ownerUserID, ownerPrepayMessageID).
+		Scan(&messageSenderID, &privateMessageID); err != nil {
+		t.Fatalf("load prepaid message root for migration probe: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM star_gift_user_message_refs
+WHERE owner_user_id=$1 AND msg_id=$2 AND saved_gift_id=$3`, ownerUserID, ownerPrepayMessageID, savedGiftID); err != nil {
+		t.Fatalf("remove prepaid alias for migration probe: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE message_boxes
+SET media=jsonb_set(media #- '{service_action,star_gift,upgrade_msg_id}',
+                    '{service_action,star_gift,can_upgrade}','true'::jsonb,true)
+WHERE message_sender_id=$1 AND private_message_id=$2 AND NOT deleted`, messageSenderID, privateMessageID); err != nil {
+		t.Fatalf("restore stale prepaid message boxes for migration probe: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE private_messages
+SET media=jsonb_set(media #- '{service_action,star_gift,upgrade_msg_id}',
+                    '{service_action,star_gift,can_upgrade}','true'::jsonb,true)
+WHERE sender_user_id=$1 AND id=$2`, messageSenderID, privateMessageID); err != nil {
+		t.Fatalf("restore stale shared prepaid message for migration probe: %v", err)
+	}
+
+	migrationSQL, err := deploy.Migrations.ReadFile("migrations/0135_star_gift_prepaid_message_refs.up.sql")
+	if err != nil {
+		t.Fatalf("read prepaid message migration: %v", err)
+	}
+	if _, err := tx.Exec(ctx, string(migrationSQL)); err != nil {
+		t.Fatalf("apply prepaid message migration probe: %v", err)
+	}
+
+	var aliasCount int
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM star_gift_user_message_refs
+WHERE owner_user_id=$1 AND msg_id=$2 AND saved_gift_id=$3`, ownerUserID, ownerPrepayMessageID, savedGiftID).Scan(&aliasCount); err != nil || aliasCount != 1 {
+		t.Fatalf("migrated prepaid alias count=%d err=%v", aliasCount, err)
+	}
+	assertMigratedAction := func(userID int64, messageID int, wantUpgradeMessageID int) {
+		t.Helper()
+		var mediaJSON string
+		var pts int
+		if err := tx.QueryRow(ctx, `SELECT media::text,pts FROM message_boxes
+WHERE owner_user_id=$1 AND box_id=$2 AND NOT deleted`, userID, messageID).Scan(&mediaJSON, &pts); err != nil {
+			t.Fatalf("load migrated prepaid box %d/%d: %v", userID, messageID, err)
+		}
+		media, err := decodeMessageMedia(mediaJSON)
+		if err != nil || media == nil || media.ServiceAction == nil || media.ServiceAction.StarGift == nil ||
+			media.ServiceAction.StarGift.CanUpgrade || media.ServiceAction.StarGift.PrepaidUpgradeHash != "" ||
+			media.ServiceAction.StarGift.UpgradeMsgID != wantUpgradeMessageID {
+			t.Fatalf("migrated prepaid box %d/%d = %+v err=%v", userID, messageID, media, err)
+		}
+		var eventCount, outboxCount int
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM user_update_events
+WHERE user_id=$1 AND pts=$2 AND event_type='edit_message' AND message_box_id=$3`, userID, pts, messageID).Scan(&eventCount); err != nil {
+			t.Fatalf("load migrated prepaid event: %v", err)
+		}
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM dispatch_outbox
+WHERE target_user_id=$1 AND pts=$2 AND event_type='edit_message'`, userID, pts).Scan(&outboxCount); err != nil {
+			t.Fatalf("load migrated prepaid outbox: %v", err)
+		}
+		if eventCount != 1 || outboxCount != 1 {
+			t.Fatalf("migrated prepaid event/outbox counts=%d/%d", eventCount, outboxCount)
+		}
+	}
+	assertMigratedAction(ownerUserID, ownerPrepayMessageID, ownerUpgradeMessageID)
+	assertMigratedAction(payerUserID, payerPrepayMessageID, 0)
+}
+
+func verifyPrepaidViewerProjectionMigrationNoop(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	savedGiftID int64,
+	ownerUserID int64,
+	senderUserID int64,
+	ownerMessageID int,
+	senderMessageID int,
+) {
+	t.Helper()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin prepaid viewer migration probe: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	var hash string
+	if err := tx.QueryRow(ctx, `SELECT prepaid_upgrade_hash FROM peer_star_gifts WHERE id=$1`, savedGiftID).Scan(&hash); err != nil || hash == "" {
+		t.Fatalf("load prepaid hash for viewer migration probe: hash=%q err=%v", hash, err)
+	}
+	var ownerPtsBefore, senderPtsBefore int
+	if err := tx.QueryRow(ctx, `SELECT contiguous_pts FROM user_update_watermarks WHERE user_id=$1`, ownerUserID).Scan(&ownerPtsBefore); err != nil {
+		t.Fatalf("load owner watermark before viewer migration: %v", err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT contiguous_pts FROM user_update_watermarks WHERE user_id=$1`, senderUserID).Scan(&senderPtsBefore); err != nil {
+		t.Fatalf("load sender watermark before viewer migration: %v", err)
+	}
+
+	var messageSenderID, privateMessageID int64
+	if err := tx.QueryRow(ctx, `SELECT message_sender_id,private_message_id FROM message_boxes
+WHERE owner_user_id=$1 AND box_id=$2 AND NOT deleted`, ownerUserID, ownerMessageID).
+		Scan(&messageSenderID, &privateMessageID); err != nil {
+		t.Fatalf("load ordinary gift message root for viewer migration: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE message_boxes
+SET media=jsonb_set(jsonb_set(media,'{service_action,star_gift,can_upgrade}','true'::jsonb,true),
+                     '{service_action,star_gift,prepaid_upgrade_hash}',to_jsonb($3::text),true)
+WHERE (owner_user_id=$1 AND box_id=$4) OR (owner_user_id=$2 AND box_id=$5)`,
+		ownerUserID, senderUserID, hash, ownerMessageID, senderMessageID); err != nil {
+		t.Fatalf("restore stale prepaid viewer boxes: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE private_messages
+SET media=jsonb_set(jsonb_set(media,'{service_action,star_gift,can_upgrade}','true'::jsonb,true),
+                     '{service_action,star_gift,prepaid_upgrade_hash}',to_jsonb($3::text),true)
+WHERE sender_user_id=$1 AND id=$2`, messageSenderID, privateMessageID, hash); err != nil {
+		t.Fatalf("restore stale prepaid shared message: %v", err)
+	}
+	var ownerMediaBefore, senderMediaBefore, sharedMediaBefore string
+	if err := tx.QueryRow(ctx, `SELECT media::text FROM message_boxes WHERE owner_user_id=$1 AND box_id=$2`,
+		ownerUserID, ownerMessageID).Scan(&ownerMediaBefore); err != nil {
+		t.Fatalf("load owner media before retired migration: %v", err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT media::text FROM message_boxes WHERE owner_user_id=$1 AND box_id=$2`,
+		senderUserID, senderMessageID).Scan(&senderMediaBefore); err != nil {
+		t.Fatalf("load sender media before retired migration: %v", err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT media::text FROM private_messages WHERE sender_user_id=$1 AND id=$2`,
+		messageSenderID, privateMessageID).Scan(&sharedMediaBefore); err != nil {
+		t.Fatalf("load shared media before retired migration: %v", err)
+	}
+	var eventsBefore, outboxBefore int
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM user_update_events WHERE user_id IN ($1,$2)`,
+		ownerUserID, senderUserID).Scan(&eventsBefore); err != nil {
+		t.Fatalf("count events before retired migration: %v", err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM dispatch_outbox WHERE target_user_id IN ($1,$2)`,
+		ownerUserID, senderUserID).Scan(&outboxBefore); err != nil {
+		t.Fatalf("count outbox before retired migration: %v", err)
+	}
+
+	migrationSQL, err := deploy.Migrations.ReadFile("migrations/0163_star_gift_prepaid_viewer_projection.up.sql")
+	if err != nil {
+		t.Fatalf("read prepaid viewer migration: %v", err)
+	}
+	if _, err := tx.Exec(ctx, string(migrationSQL)); err != nil {
+		t.Fatalf("apply prepaid viewer migration probe: %v", err)
+	}
+
+	var ownerMediaAfter, senderMediaAfter, sharedMediaAfter string
+	var ownerPtsAfter, senderPtsAfter int
+	if err := tx.QueryRow(ctx, `SELECT media::text,pts FROM message_boxes WHERE owner_user_id=$1 AND box_id=$2`,
+		ownerUserID, ownerMessageID).Scan(&ownerMediaAfter, &ownerPtsAfter); err != nil {
+		t.Fatalf("load owner box after retired migration: %v", err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT media::text,pts FROM message_boxes WHERE owner_user_id=$1 AND box_id=$2`,
+		senderUserID, senderMessageID).Scan(&senderMediaAfter, &senderPtsAfter); err != nil {
+		t.Fatalf("load sender box after retired migration: %v", err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT media::text FROM private_messages WHERE sender_user_id=$1 AND id=$2`,
+		messageSenderID, privateMessageID).Scan(&sharedMediaAfter); err != nil {
+		t.Fatalf("load shared media after retired migration: %v", err)
+	}
+	if ownerMediaAfter != ownerMediaBefore || senderMediaAfter != senderMediaBefore || sharedMediaAfter != sharedMediaBefore {
+		t.Fatalf("retired migration changed message media")
+	}
+	if ownerPtsAfter != ownerPtsBefore || senderPtsAfter != senderPtsBefore {
+		t.Fatalf("retired migration changed PTS: owner=%d/%d sender=%d/%d",
+			ownerPtsBefore, ownerPtsAfter, senderPtsBefore, senderPtsAfter)
+	}
+	var eventsAfter, outboxAfter int
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM user_update_events WHERE user_id IN ($1,$2)`,
+		ownerUserID, senderUserID).Scan(&eventsAfter); err != nil {
+		t.Fatalf("count events after retired migration: %v", err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM dispatch_outbox WHERE target_user_id IN ($1,$2)`,
+		ownerUserID, senderUserID).Scan(&outboxAfter); err != nil {
+		t.Fatalf("count outbox after retired migration: %v", err)
+	}
+	if eventsAfter != eventsBefore || outboxAfter != outboxBefore {
+		t.Fatalf("retired migration changed event/outbox counts: events=%d/%d outbox=%d/%d",
+			eventsBefore, eventsAfter, outboxBefore, outboxAfter)
+	}
+	var storedHash string
+	if err := tx.QueryRow(ctx, `SELECT prepaid_upgrade_hash FROM peer_star_gifts WHERE id=$1`, savedGiftID).Scan(&storedHash); err != nil || storedHash != hash {
+		t.Fatalf("retired migration changed aggregate hash=%q want=%q err=%v", storedHash, hash, err)
+	}
+
+	// Reproduce the deployment shape that made the original 0163 abort. A
+	// retired version slot must advance even when an aggregate has no live owner
+	// box; it has no authority to classify or repair historical message state.
+	if _, err := tx.Exec(ctx, `DELETE FROM message_boxes WHERE owner_user_id=$1 AND box_id=$2`,
+		ownerUserID, ownerMessageID); err != nil {
+		t.Fatalf("remove owner box for retired migration probe: %v", err)
+	}
+	if _, err := tx.Exec(ctx, string(migrationSQL)); err != nil {
+		t.Fatalf("retired migration rejected missing owner box: %v", err)
+	}
+}
+
+// TestStarGiftResaleFloorIgnoresTrollListingsPostgres pins the troll-proof
+// resale floor: one overpriced listing set far above the gift's base price must
+// not become the enforced minimum for everybody else. The floor stays the
+// cheapest live listing of the gift type, ignoring listings priced above
+// StarGiftResaleFloorMultiple x the active revision's base stars — so a single
+// ~600 XTR gift listed at 35000 XTR no longer locks the market, while genuine
+// premiums within the multiple still push the floor up.
+func TestStarGiftResaleFloorIgnoresTrollListingsPostgres(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	suffix := randomSuffix(t)
+	now := int(time.Now().Unix())
+	users := NewUserStore(pool)
+	troll := createTestUser(t, ctx, users, "+1884"+suffix+"01", "TrollSeller", "")
+	legit := createTestUser(t, ctx, users, "+1884"+suffix+"02", "LegitSeller", "")
+	stars := NewStarsStore(pool)
+	for _, u := range []domain.User{troll, legit} {
+		if _, _, err := stars.EnsureGrant(ctx, u.ID, 20000, now); err != nil {
+			t.Fatalf("grant: %v", err)
+		}
+	}
+
+	gifts := NewStarGiftStore(pool)
+	base := time.Now().UnixNano() & 0x7ffffffffffff000
+	entry, err := gifts.CreateCatalogRevision(ctx, domain.StarGiftCatalogWrite{
+		Title: "Troll Floor " + suffix, Stars: 600, ConvertStars: 200, Enabled: true,
+		Document: collectibleTestDocument(base, "troll-floor.tgs"),
+		Blob:     collectibleTestBlob(base, "troll-floor"), Animation: collectibleTestAnimation("troll-floor.tgs"),
+		Actor: "integration", CommandID: "troll-floor-catalog-" + suffix,
+	})
+	if err != nil {
+		t.Fatalf("catalog: %v", err)
+	}
+	if _, err := gifts.PublishCollectibleRevision(ctx, domain.StarGiftCollectibleWrite{
+		GiftID: entry.Gift.ID, UpgradeStars: 100, SupplyTotal: 20, SlugPrefix: "tf-" + suffix,
+		Models: []domain.StarGiftCollectibleAttribute{
+			{Kind: domain.StarGiftCollectibleModel, Name: "Base", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestDocumentPtr(base+1, "tf-model.tgs"), Blob: collectibleTestBlobPtr(base+1, "tf-model"), Animation: collectibleTestAnimationPtr("tf-model.tgs")},
+			{Kind: domain.StarGiftCollectibleModel, Name: "Base Two", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestDocumentPtr(base+4, "tf-model-two.tgs"), Blob: collectibleTestBlobPtr(base+4, "tf-model-two"), Animation: collectibleTestAnimationPtr("tf-model-two.tgs")},
+		},
+		Patterns: []domain.StarGiftCollectibleAttribute{
+			{Kind: domain.StarGiftCollectiblePattern, Name: "Orbit", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestPatternDocumentPtr(base+2, "tf-pattern.tgs"), Blob: collectibleTestBlobPtr(base+2, "tf-pattern"), Animation: collectibleTestAnimationPtr("tf-pattern.tgs")},
+			{Kind: domain.StarGiftCollectiblePattern, Name: "Orbit Two", RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000,
+				Document: collectibleTestPatternDocumentPtr(base+3, "tf-pattern-two.tgs"), Blob: collectibleTestBlobPtr(base+3, "tf-pattern-two"), Animation: collectibleTestAnimationPtr("tf-pattern-two.tgs")},
+		},
+		Backdrops: []domain.StarGiftCollectibleAttribute{
+			{Kind: domain.StarGiftCollectibleBackdrop, Name: "Night", BackdropID: 77, CenterColor: 0x112233, EdgeColor: 0x223344, PatternColor: 0x334455, TextColor: 0xffffff, RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000},
+			{Kind: domain.StarGiftCollectibleBackdrop, Name: "Day", BackdropID: 78, CenterColor: 0xaabbcc, EdgeColor: 0x778899, PatternColor: 0xddeeff, TextColor: 0x111111, RarityKind: domain.StarGiftRarityPermille, RarityPermille: 1000},
+		},
+		Actor: "integration", CommandID: "troll-floor-pool-" + suffix,
+	}); err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+
+	messages := NewMessageStore(pool)
+	lifecycle := NewStarGiftLifecycleStore(pool, messages, 1_000_000, WithStarGiftMarketPolicy(domain.StarGiftMarketPolicy{
+		StarsProceedsPermille: 900, TONProceedsPermille: 900,
+	}))
+	upgrades := NewStarGiftUpgradeStore(pool, messages, WithStarGiftLifecyclePolicy(domain.StarGiftLifecyclePolicy{
+		TransferStars: 25, DropOriginalDetailsStars: 25, OfferMinStars: 1, CraftChancePermille: 500,
+	}))
+
+	upgradeUnique := func(user domain.User, buyerUserID int64, cmd, ref string, date int) (domain.UniqueStarGift, domain.SavedStarGiftRef) {
+		t.Helper()
+		purchase := issueLifecyclePurchaseForm(t, ctx, lifecycle, domain.StarGiftPurchaseRequest{
+			BuyerUserID: buyerUserID, To: domain.Peer{Type: domain.PeerTypeUser, ID: user.ID},
+			GiftID: entry.Gift.ID, IncludeUpgrade: true, CommandKey: "tf-purchase-" + ref + "-" + cmd, Date: date,
+		})
+		bought, err := lifecycle.PurchaseStarGift(ctx, purchase)
+		if err != nil {
+			t.Fatalf("purchase %s: %v", ref, err)
+		}
+		upgraded, err := upgrades.UpgradeStarGift(ctx, domain.StarGiftUpgradeRequest{
+			UserID: user.ID, Ref: domain.SavedStarGiftRef{Owner: domain.Peer{Type: domain.PeerTypeUser, ID: user.ID}, MsgID: bought.Saved.MsgID},
+			RequirePrepaid: true, KeepOriginalDetails: true, CommandKey: "tf-upgrade-" + ref + "-" + cmd, Date: date + 1,
+		})
+		if err != nil {
+			t.Fatalf("upgrade %s: %v", ref, err)
+		}
+		ref2 := domain.SavedStarGiftRef{Owner: domain.Peer{Type: domain.PeerTypeUser, ID: user.ID}, MsgID: upgraded.Saved.MsgID}
+		return upgraded.Unique, ref2
+	}
+	trollUnique, trollRef := upgradeUnique(troll, troll.ID, suffix, "troll", now)
+	legitUnique, legitRef := upgradeUnique(legit, legit.ID, suffix, "legit", now+10)
+
+	readFloor := func() int64 {
+		t.Helper()
+		var floor int64
+		if err := pool.QueryRow(ctx, `SELECT resell_min_stars FROM star_gift_catalog WHERE gift_id=$1`, entry.Gift.ID).Scan(&floor); err != nil {
+			t.Fatalf("read floor: %v", err)
+		}
+		return floor
+	}
+	readValueFloor := func(uniqueID int64) int64 {
+		t.Helper()
+		info, err := lifecycle.UniqueStarGiftValueInfo(ctx, uniqueID)
+		if err != nil {
+			t.Fatalf("value info: %v", err)
+		}
+		return info.FloorPrice
+	}
+
+	// The troll lists far above the gift's ~600 XTR base price. The listing is
+	// allowed, but it must not become the enforced floor for the gift type.
+	if _, err := lifecycle.SetStarGiftListing(ctx, domain.StarGiftListingRequest{
+		ActorUserID: troll.ID,
+		Ref:         trollRef,
+		Amount:      &domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 35000}, Date: now + 2,
+	}); err != nil {
+		t.Fatalf("troll listing: %v", err)
+	}
+	if floor := readFloor(); floor != 0 {
+		t.Fatalf("floor after troll listing = %d, want 0 (troll price must not count)", floor)
+	}
+	info, err := lifecycle.UniqueStarGiftValueInfo(ctx, trollUnique.ID)
+	if err != nil || info.FloorPrice != 0 {
+		t.Fatalf("value floor after troll listing = %+v err %v, want 0", info, err)
+	}
+
+	// The troll listing must not block a genuine undercut, and a genuine premium
+	// within N x base (6000) must restore the floor to its real market value.
+	if _, err := lifecycle.SetStarGiftListing(ctx, domain.StarGiftListingRequest{
+		ActorUserID: legit.ID,
+		Ref:         legitRef,
+		Amount:      &domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 3000}, Date: now + 12,
+	}); err != nil {
+		t.Fatalf("legit listing undercutting the troll: %v", err)
+	}
+	if floor := readFloor(); floor != 3000 {
+		t.Fatalf("floor after legit listing = %d, want 3000", floor)
+	}
+	if floor := readValueFloor(trollUnique.ID); floor != 3000 {
+		t.Fatalf("troll value floor = %d, want 3000", floor)
+	}
+	if floor := readValueFloor(legitUnique.ID); floor != 3000 {
+		t.Fatalf("legit value floor = %d, want 3000", floor)
+	}
+
+	// A listing even further from the true market still cannot undercut the real
+	// market floor — the dynamic minimum keeps protecting against crash-downs.
+	if _, err := lifecycle.SetStarGiftListing(ctx, domain.StarGiftListingRequest{
+		ActorUserID: legit.ID,
+		Ref:         legitRef,
+		Amount:      &domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 2500}, Date: now + 13,
+	}); err == nil || !errors.Is(err, domain.ErrStarGiftResaleUnavailable) {
+		t.Fatalf("undercut below the real floor = %v, want ErrStarGiftResaleUnavailable", err)
+	}
+}
+
+func craftedSourceEditForUserAndGift(result domain.StarGiftCraftResult, userID, uniqueGiftID int64) domain.EditedMessageForUser {
+	for _, edit := range result.SourceEdits {
+		if edit.UserID != userID {
+			continue
+		}
+		action := starGiftUniqueActionFromEdit(edit)
+		if action != nil && action.Gift.ID == uniqueGiftID {
+			return edit
+		}
+	}
+	return domain.EditedMessageForUser{UserID: userID}
+}
+
+func starGiftUniqueActionFromEdit(edit domain.EditedMessageForUser) *domain.MessageStarGiftUniqueAction {
+	if edit.Message.Media == nil || edit.Message.Media.ServiceAction == nil {
+		return nil
+	}
+	return edit.Message.Media.ServiceAction.StarGiftUnique
+}

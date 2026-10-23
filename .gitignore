@@ -1,0 +1,59 @@
+# Go build artifacts
+/bin/
+*.exe
+# Root build output from `go build ./...` -- never a repo artifact.
+/telesrv
+/telesrv-admin
+/telesrv-load
+/telesrv-update
+/gramsrv-backup
+*.test
+*.out
+coverage.*
+node_modules/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 本地环境 / 密钥（server RSA private key 必须持久化，但禁止入库）
+.env
+.env.*
+!.env.example
+*.local
+*.pem
+*.key
+/secrets/
+/data/*
+!/data/langpack/
+!/data/langpack/**
+logs/
+tmp/
+.gocache/
+.tdesktop-e2e/
+# Telegram 授权会话与 QR 登录产物（giftfetch -login-qr / appearancefetch /
+# giftfetch_telethon.py）。这些文件等价于账号凭据，任何情况下都不得入库。
+*.session
+*.session.qr.png
+
+# IDE
+.idea/
+.vscode/
+
+# gramsrv-backup bundles: they contain .env, the server RSA key and the login
+# signing keys. Never commit them.
+/backup/
+/backups/
+/bundle/
+*.tar.zst
+*.sql.zst
+*.rdb.zst
+
+# Internal server deployment script (not part of the public repository)
+/scripts/install.sh
+
+# Local scratch files (not part of the repository)
+/gifts_catalog/
+/fix_docs.py
+/main.py

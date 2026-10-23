@@ -1,0 +1,559 @@
+@font-face { font-family: "Plus Jakarta Sans"; font-style: normal; font-weight: 400; font-display: swap; src: url("/fonts/plus-jakarta-sans-400.woff2") format("woff2"); }
+@font-face { font-family: "Plus Jakarta Sans"; font-style: normal; font-weight: 500; font-display: swap; src: url("/fonts/plus-jakarta-sans-500.woff2") format("woff2"); }
+@font-face { font-family: "Plus Jakarta Sans"; font-style: normal; font-weight: 600; font-display: swap; src: url("/fonts/plus-jakarta-sans-600.woff2") format("woff2"); }
+@font-face { font-family: "Plus Jakarta Sans"; font-style: normal; font-weight: 700; font-display: swap; src: url("/fonts/plus-jakarta-sans-700.woff2") format("woff2"); }
+@font-face { font-family: "Plus Jakarta Sans"; font-style: normal; font-weight: 800; font-display: swap; src: url("/fonts/plus-jakarta-sans-800.woff2") format("woff2"); }
+
+:root {
+  color-scheme: light;
+
+  /* Surfaces */
+  --bg: #f7f9fc;
+  --bg-accent: #eef1f5;
+  --panel: #ffffff;
+  --panel-subtle: #f7f9fc;
+  --panel-strong: #f1f5f9;
+  /* Loading placeholders. Kept as their own pair rather than reusing the
+     panel shades because the sheen has to read as lighter than the base in
+     both themes, and the panel ramp runs the opposite way in dark. */
+  --skeleton-base: #e6ebf2;
+  --skeleton-sheen: #f4f7fa;
+  --surface-soft: #f2f7fd;
+  --overlay: rgba(24, 34, 47, 0.42);
+  --topbar-bg: rgba(255, 255, 255, 0.94);
+
+  /* Lines */
+  --line: #e2e8f0;
+  --line-strong: #cbd5e1;
+
+  /* Text */
+  --heading: #101828;
+  --text: #0f1720;
+  --text-soft: #344054;
+  --muted: #64748b;
+  --muted-2: #94a3b8;
+
+  /* Brand */
+  --brand: #2563eb;
+  --brand-strong: #1d4ed8;
+  --brand-2: #38bdf8;
+  --grad: linear-gradient(135deg, #38bdf8 0%, #2563eb 55%, #1e40af 100%);
+  --brand-tint: #eaf2fd;
+  --brand-tint-border: #c7dcf9;
+  --brand-tint-text: #1e3a8a;
+
+  /* Semantic */
+  --good: #167447;
+  --good-tint: #eaf6ef;
+  --good-border: #c1e1cf;
+  --warn: #a15c07;
+  --warn-tint: #fcf4e4;
+  --warn-border: #e7d09e;
+  --danger: #b42318;
+  --danger-tint: #fcefec;
+  --danger-border: #eecac3;
+  --danger-text: #8f2f27;
+
+  /* Accent (collectibles / craft) */
+  --purple: #6a4fa3;
+  --purple-tint: #f4effb;
+  --purple-border: #dcd0f0;
+  --purple-text: #5a4590;
+
+  /* Inputs & controls */
+  --input-bg: #ffffff;
+  --btn-bg: #ffffff;
+  --btn-text: #29323d;
+  --btn-hover: #f4f7fa;
+  --switch-track: #c8d0d6;
+
+  /* Code / JSON blocks */
+  --code-bg: #1b2733;
+  --code-text: #d6e3ef;
+  --code-border: #2b3a49;
+
+  /* Sidebar */
+  --sidebar: #08080e;
+  --sidebar-soft: #12121a;
+  --sidebar-line: #222228;
+  --sidebar-row: #17171f;
+  --sidebar-text: #c6d0dc;
+  --sidebar-muted: #8fa0b4;
+  --sidebar-faint: #8492a6;
+  --sidebar-heading: #ffffff;
+
+  /* Effects */
+  --focus: rgba(37, 99, 235, 0.16);
+  --shadow: 0 28px 70px -36px rgba(5, 5, 8, 0.35);
+  --shadow-sm: 0 2px 10px rgba(24, 39, 56, 0.05);
+  --shadow-brand: 0 8px 22px rgba(37, 99, 235, 0.22);
+  --hero-glow: rgba(37, 99, 235, 0.14);
+  --hero-grid: rgba(5, 5, 8, 0.04);
+
+  /* Radii */
+  --radius-xs: 8px;
+  --radius-sm: 9px;
+  --radius: 11px;
+  --radius-lg: 14px;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #0f141a;
+  --bg-accent: #131a22;
+  --panel: #171f28;
+  --panel-subtle: #1c2530;
+  --panel-strong: #212c38;
+  --skeleton-base: #212c38;
+  --skeleton-sheen: #2e3d4c;
+  --surface-soft: #1a232d;
+  --overlay: rgba(5, 8, 12, 0.62);
+  --topbar-bg: rgba(21, 28, 36, 0.86);
+
+  --line: #29333f;
+  --line-strong: #38434f;
+
+  --heading: #eef3f8;
+  --text: #d5dde6;
+  --text-soft: #c2ccd6;
+  --muted: #98a4b1;
+  --muted-2: #6d7885;
+
+  --brand: #5b9dff;
+  --brand-strong: #7db4ff;
+  --brand-2: #7cd1fb;
+  --brand-tint: #142a4a;
+  --brand-tint-border: #24466e;
+  --brand-tint-text: #9dc3f5;
+
+  --good: #47c281;
+  --good-tint: #12301f;
+  --good-border: #245639;
+  --warn: #e0aa4d;
+  --warn-tint: #322810;
+  --warn-border: #574413;
+  --danger: #e6695c;
+  --danger-tint: #35201d;
+  --danger-border: #5c332d;
+  --danger-text: #f0a49b;
+
+  --purple: #ac90e2;
+  --purple-tint: #221b31;
+  --purple-border: #3d3357;
+  --purple-text: #c9b6ef;
+
+  --input-bg: #131a22;
+  --btn-bg: #1e2731;
+  --btn-text: #dbe2ea;
+  --btn-hover: #26313d;
+  --switch-track: #3a454f;
+
+  --code-bg: #0c1218;
+  --code-text: #cdd9e5;
+  --code-border: #232f3b;
+
+  --sidebar: #10151b;
+  --sidebar-soft: #1c242f;
+  --sidebar-line: #262f3a;
+  --sidebar-row: #161d25;
+  --sidebar-text: #cbd4de;
+  --sidebar-muted: #7c8794;
+  --sidebar-faint: #6f7b88;
+  --sidebar-heading: #f0f4f8;
+
+  --focus: rgba(91, 157, 255, 0.24);
+  --shadow: 0 16px 40px rgba(0, 0, 0, 0.46);
+  --shadow-sm: 0 2px 12px rgba(0, 0, 0, 0.38);
+  --shadow-brand: 0 8px 22px rgba(91, 157, 255, 0.26);
+  --hero-glow: rgba(91, 157, 255, 0.25);
+  --hero-grid: rgba(255, 255, 255, 0.04);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  color: var(--text);
+  background: var(--bg);
+  font: 13px/1.45 "Plus Jakarta Sans", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  transition: background-color 200ms ease, color 200ms ease;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.shell {
+  display: grid;
+  min-height: 100vh;
+  grid-template-columns: 220px minmax(0, 1fr);
+}
+
+.sidebar {
+  position: sticky;
+  top: 0;
+  display: flex;
+  height: 100vh;
+  flex-direction: column;
+  gap: 16px;
+  overflow-y: auto;
+  padding: 18px 12px;
+  color: var(--sidebar-text);
+  background: var(--sidebar);
+  border-right: 1px solid var(--sidebar-line);
+}
+
+/* Desktop keeps the sidebar fully expanded, so the expand/collapse toggle is
+   only needed on the mobile rail. Hidden here, re-enabled in the responsive
+   block. */
+.sidebar-toggle-wrap {
+  display: none;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 42px;
+  padding: 0 4px;
+}
+
+.brand.compact {
+  justify-content: center;
+}
+
+.brand-elevated .brand-mark {
+  box-shadow: var(--shadow-brand);
+}
+
+/* The brand mark is a rounded square, not a circle. An operator uploads a
+   square image, and clipping it to a circle cut the corners off artwork they
+   designed as a square -- a logo that reads as "a square with empty borders
+   where a circle should be". A squircle shows the uploaded pixels as they were
+   drawn and still reads as an app icon at 30px. */
+.brand-mark {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  border-radius: 30%;
+  overflow: hidden;
+  place-items: center;
+}
+
+.brand-mark img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.brand strong {
+  display: block;
+  font-size: 14px;
+  line-height: 1.1;
+}
+
+.brand small {
+  display: block;
+  margin-top: 3px;
+  color: var(--sidebar-muted);
+  font-size: 11px;
+}
+
+.sidebar-label {
+  padding: 0 8px;
+  color: var(--sidebar-faint);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.nav-list {
+  display: grid;
+  gap: 4px;
+}
+
+.nav-section {
+  display: grid;
+  gap: 4px;
+}
+
+.nav-section-toggle {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) 16px;
+  width: 100%;
+  min-height: 38px;
+  align-items: center;
+  gap: 9px;
+  padding: 0 10px;
+  color: var(--sidebar-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+  text-align: left;
+  transition: color 140ms ease, background-color 140ms ease, border-color 140ms ease;
+}
+
+.nav-section-toggle:hover,
+.nav-section.active .nav-section-toggle {
+  color: var(--sidebar-heading);
+  background: var(--sidebar-soft);
+  border-color: #34404d;
+}
+
+.nav-section-chevron {
+  justify-self: end;
+  color: var(--sidebar-muted);
+  transition: transform 140ms ease;
+}
+
+.nav-section.open .nav-section-chevron {
+  transform: rotate(180deg);
+}
+
+.nav-children {
+  display: grid;
+  gap: 4px;
+  padding: 2px 0 2px 18px;
+}
+
+.nav-item {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  min-height: 38px;
+  align-items: center;
+  gap: 9px;
+  padding: 0 10px;
+  color: var(--sidebar-text);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  transition: color 140ms ease, background-color 140ms ease, border-color 140ms ease;
+}
+
+.nav-dot {
+  width: 6px;
+  height: 6px;
+  justify-self: center;
+  background: var(--sidebar-faint);
+  border-radius: 999px;
+}
+
+.nav-item:hover,
+.nav-item.active {
+  color: var(--sidebar-heading);
+  background: var(--sidebar-soft);
+  border-color: #34404d;
+}
+
+.nav-item.active .nav-dot {
+  background: var(--brand);
+}
+
+.sidebar-status {
+  display: grid;
+  gap: 7px;
+  margin-top: auto;
+}
+
+.runtime-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  min-height: 32px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 8px;
+  color: var(--sidebar-text);
+  background: var(--sidebar-row);
+  border: 1px solid #27313c;
+  border-radius: var(--radius-sm);
+}
+
+.runtime-row strong {
+  color: var(--sidebar-heading);
+  font-size: 11px;
+}
+
+.workspace {
+  min-width: 0;
+}
+
+.topbar {
+  position: sticky;
+  z-index: 20;
+  top: 0;
+  display: flex;
+  min-height: 66px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 12px 24px;
+  background: var(--topbar-bg);
+  border-bottom: 1px solid var(--line);
+  backdrop-filter: blur(12px);
+}
+
+.topbar h1 {
+  margin: 2px 0 0;
+  color: var(--heading);
+  font-size: 20px;
+  line-height: 1.2;
+}
+
+.topbar-actions,
+.page-actions,
+.section-action,
+.entity-badges,
+.row-actions,
+.modal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.language-switch {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  padding: 2px;
+  background: var(--panel-subtle);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.language-switch button {
+  min-width: 42px;
+  min-height: 24px;
+  padding: 0 9px;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: 999px;
+  cursor: pointer;
+  font-weight: 800;
+  transition: color 140ms ease, background-color 140ms ease;
+}
+
+.language-switch button.active {
+  color: #ffffff;
+  background: var(--brand);
+}
+
+.language-switch button:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+.theme-toggle {
+  display: inline-grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  color: var(--muted);
+  background: var(--panel-subtle);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: color 160ms ease, background-color 160ms ease, border-color 160ms ease;
+}
+
+.theme-toggle:hover {
+  color: var(--brand);
+  border-color: var(--brand-tint-border);
+  background: var(--brand-tint);
+}
+
+.theme-toggle:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+.actor-pill {
+  display: inline-flex;
+  min-height: 30px;
+  /* Icon and name read as one label rather than two adjacent things. */
+  gap: 6px;
+  align-items: center;
+  padding: 0 12px;
+  font-weight: 600;
+  color: var(--text-soft);
+  background: var(--panel-subtle);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.content {
+  display: grid;
+  gap: 16px;
+  padding: 18px 24px 30px;
+}
+
+/* On a screen with both width and height to spare the shell becomes a
+   viewport-height grid so the content area, rather than the document, is what
+   scrolls. The topbar and the sidebar were already independent of the scroll
+   position -- one sticky, one height-locked -- so pinning the shell changes
+   nothing about them, and it is what lets the overview size itself to the
+   space it has instead of guessing at it.
+
+   The min-height is the honest part: a short laptop window does not have the
+   vertical room for a fixed-height overview, and squeezing it produced panels
+   clipped to a few pixels rather than anything readable. Below that the old
+   document scroll applies and the page simply gets taller, which is what every
+   other page in the panel has always done. */
+@media (min-width: 1181px) and (min-height: 820px) {
+  .shell {
+    height: 100vh;
+  }
+
+  .workspace {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .content {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    /* Stop the one implicit row from absorbing the leftover height. A grid
+       container with a definite height stretches its auto-sized rows by
+       default, and every page in the panel is a single .page-frame -- so each
+       page card was pulled to the full viewport with its own rows smeared out
+       to match, which is the "everything is stretched" look. The overview
+       opts back in with an explicit 1fr row (.content:has(> .overview) in
+       02-pages-and-forms.css); everything else stacks from the top, which is
+       how it behaved before this media query existed. */
+    align-content: start;
+  }
+}
+
+.eyebrow {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
