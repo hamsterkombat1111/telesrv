@@ -147,7 +147,7 @@ func (r *Router) resolveWalletTransferRecipient(ctx context.Context, senderID in
 				return ids[0], nil
 			}
 			if u, ok := input.(*tg.InputUser); ok && u.UserID > 0 && r.deps.Users != nil {
-				user, found, uErr := r.deps.Users.AdminUser(ctx, u.UserID)
+				user, found, uErr := r.deps.Users.ByID(ctx, senderID, u.UserID)
 				if uErr == nil && found && !user.Deleted && user.ID > 0 {
 					return user.ID, nil
 				}
