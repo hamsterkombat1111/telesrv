@@ -79,14 +79,14 @@ func transferFromRelaxed(msg tlb.MessageRelaxed) (ParsedTransfer, bool) {
 	if dst == nil {
 		return ParsedTransfer{}, false
 	}
-	amount := msg.Info.Amount.Nano()
-	if amount <= 0 {
+	amount := msg.Info.Amount
+	if amount == nil || amount.Sign() <= 0 {
 		return ParsedTransfer{}, false
 	}
 	return ParsedTransfer{
 		Amount:      amount.Int64(),
 		Destination: dst.String(),
-		Comment:     commentFromBody(msg.Body.Body),
+		Comment:     commentFromBody(msg.Body.Ref),
 	}, true
 }
 
@@ -95,7 +95,7 @@ func transferFromInternal(msg *tlb.InternalMessage) (ParsedTransfer, bool) {
 		return ParsedTransfer{}, false
 	}
 	amount := msg.Amount.Nano()
-	if amount <= 0 {
+	if amount == nil || amount.Sign() <= 0 {
 		return ParsedTransfer{}, false
 	}
 	return ParsedTransfer{
