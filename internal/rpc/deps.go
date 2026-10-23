@@ -655,6 +655,7 @@ type ChatlistsService interface {
 // MessagesService 抽象消息历史、搜索与已读。
 type MessagesService interface {
 	SendPrivateText(ctx context.Context, userID int64, req domain.SendPrivateTextRequest) (domain.SendPrivateTextResult, error)
+	PostPrivateServiceMessage(ctx context.Context, recipientUserID, fromUserID int64, req domain.SendPrivateTextRequest) (domain.SendPrivateTextResult, error)
 	SetChatTheme(ctx context.Context, userID int64, req domain.SetPrivateChatThemeRequest) (domain.SetPrivateChatThemeResult, error)
 	ForwardPrivateMessages(ctx context.Context, userID int64, req domain.ForwardPrivateMessagesRequest) (domain.ForwardPrivateMessagesResult, error)
 	GetMessages(ctx context.Context, userID int64, ids []int) (domain.MessageList, error)
