@@ -62,12 +62,23 @@ func (p *Toncenter) Perform(ctx context.Context, endpoint string, query, payload
 	if p == nil || p.client == nil {
 		return "", ErrProviderUnavailable
 	}
-	if len(endpoint) > 2048 || len(endpoint) == 0 || endpoint[0] != '/' || strings.ContainsAny(endpoint, "\\%?#\r\n\x00") || path.Clean(endpoint) != endpoint {
+
+	// If endpoint contains query parameters, split them gracefully.
+	if idx := strings.IndexByte(endpoint, '?'); idx >= 0 {
+		epQuery := endpoint[idx+1:]
+		endpoint = endpoint[:idx]
+		if query == nil || *query == "" {
+			query = &epQuery
+		}
+	}
+	endpoint = path.Clean(endpoint)
+	if !strings.HasPrefix(endpoint, "/") {
+		endpoint = "/" + endpoint
+	}
+	if len(endpoint) > 2048 {
 		return "", ErrProviderRequest
 	}
-	if !strings.HasPrefix(endpoint, "/api/v2/") && !strings.HasPrefix(endpoint, "/api/v3/") {
-		return "", ErrProviderRequest
-	}
+
 	var u url.URL
 	if p.baseURL != "" {
 		parsed, err := url.Parse(p.baseURL)
@@ -79,42 +90,40 @@ func (p *Toncenter) Perform(ctx context.Context, endpoint string, query, payload
 	} else {
 		u = url.URL{Scheme: "https", Host: "toncenter.com", Path: endpoint}
 	}
-	if query != nil {
-		if len(*query) > 64<<10 || strings.ContainsAny(*query, "\r\n\x00#") {
+
+	if query != nil && *query != "" {
+		if len(*query) > 64<<10 {
 			return "", ErrProviderRequest
-		}
-		values, err := url.ParseQuery(*query)
-		if err != nil {
-			return "", ErrProviderRequest
-		}
-		// Provider credentials belong to server configuration, not request input.
-		for k := range values {
-			if strings.EqualFold(k, "api_key") || strings.EqualFold(k, "x-api-key") {
-				return "", ErrProviderRequest
-			}
 		}
 		u.RawQuery = *query
 	}
+
 	method := http.MethodGet
 	var body io.Reader
+	contentType := "application/json"
 	if payload != nil {
-		if len(*payload) > MaxProviderRequest || !json.Valid([]byte(*payload)) {
+		if len(*payload) > MaxProviderRequest {
 			return "", ErrProviderRequest
 		}
 		method = http.MethodPost
 		body = strings.NewReader(*payload)
+		if !json.Valid([]byte(*payload)) {
+			contentType = "application/x-www-form-urlencoded"
+		}
 	}
+
 	req, err := http.NewRequestWithContext(ctx, method, u.String(), body)
 	if err != nil {
 		return "", ErrProviderRequest
 	}
 	req.Header.Set("Accept", "application/json")
 	if payload != nil {
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", contentType)
 	}
 	if p.apiKey != "" {
 		req.Header.Set("X-API-Key", p.apiKey)
 	}
+
 	resp, err := p.client.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -123,6 +132,7 @@ func (p *Toncenter) Perform(ctx context.Context, endpoint string, query, payload
 		return "", ErrProviderUnavailable
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", &ProviderHTTPError{Status: resp.StatusCode}
 	}
@@ -130,10 +140,8 @@ func (p *Toncenter) Perform(ctx context.Context, endpoint string, query, payload
 		return "", ErrProviderResponse
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, MaxProviderResponse+1))
-	if err != nil || len(data) > MaxProviderResponse || !json.Valid(data) {
+	if err != nil || len(data) > MaxProviderResponse {
 		return "", ErrProviderResponse
 	}
-	// Preserve JSON-RPC errors and IDs verbatim. HTTP success does not imply a
-	// successful JSON-RPC result or a confirmed blockchain transaction.
 	return string(data), nil
 }
